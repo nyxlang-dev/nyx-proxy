@@ -1,0 +1,119 @@
+// standalone.nx — Minimal runnable example of the nyx-proxy library.
+//
+// This is a smoke test AND a template: it wires the library modules
+// into a working reverse proxy using whatever `proxy.toml` is in the
+// current directory, with no deployment-specific state baked in.
+//
+// Use this as a starting point when building your own gateway project:
+//   1. Copy this file into your project's src/main.nx.
+//   2. Declare nyx-proxy as a dependency in your nyx.toml.
+//   3. Add any tls_server_add_cert(...) calls for the hostnames you serve.
+//   4. Adjust the listener / worker topology if you need something custom.
+//
+// Build from products/proxy/:
+//   nyx build     -> produces ./nyx-proxy (a fully functional HTTP proxy
+//                    that reads proxy.toml from the current directory)
+//
+// See services/gateway/ for a real production consumer that adds TLS +
+// SNI + :80 redirect on top of this same library.
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+// Channel for accepted client fds dispatched to workers
+var g_proxy_ch: Map = Map.new()
+
+// HTTP worker: keep-alive loop over plain TCP
+fn http_worker() -> int {
+    while 1 > 0 {
+        let client: int = channel_recv(g_proxy_ch)
+        if client < 0 { return 0 }
+
+        let client_ip: String = getpeername(client)
+        var keep_alive: bool = true
+        while keep_alive {
+            let request: Array = http_parse_request_fast(client)
+            let method: String = request[1]
+            if method.length() == 0 {
+                keep_alive = false
+            } else {
+                let rl_resp: String = proxy_check_rate(client_ip)
+                if rl_resp.length() > 0 {
+                    tcp_write(client, rl_resp)
+                } else {
+                    let response: String = proxy_dispatch(request)
+                    if response.length() > 0 {
+                        tcp_write(client, response)
+                    }
+                }
+                let headers: Array = request[3]
+                let conn: String = http_find_header(headers, "Connection")
+                if conn == "close" {
+                    keep_alive = false
+                }
+            }
+        }
+        tcp_close(client)
+    }
+    return 0
+}
+
+fn print_upstreams() {
+    var i: int = 0
+    while i < g_upstream_count {
+        let name: String = g_upstream_names[i]
+        let prefix: String = g_upstream_prefixes[i]
+        if prefix.length() > 0 {
+            print("  " + name + " [" + prefix + "]")
+        } else {
+            print("  " + name + " [default]")
+        }
+        i = i + 1
+    }
+}
+
+fn main() {
+    // Reads proxy.toml from the current directory. See proxy.toml.example
+    // for the supported schema.
+    load_config("proxy.toml")
+
+    if g_tls_enabled == 1 {
+        print("nyx-proxy standalone example: TLS is configured in proxy.toml")
+        print("but this example does not register SNI certs. For a real")
+        print("HTTPS deployment, copy this file and add tls_server_add_cert()")
+        print("calls before entering the accept loop — see services/gateway/.")
+        return 0
+    }
+
+    print("nyx-proxy standalone (HTTP)")
+    print("Listening on port " + int_to_string(g_listen_port) + " with " + int_to_string(g_workers) + " workers")
+    print_upstreams()
+
+    g_proxy_ch = channel_new(512)
+    let server: int = tcp_listen("0.0.0.0", g_listen_port)
+    if server < 0 {
+        print("ERROR: cannot listen on port " + int_to_string(g_listen_port))
+        return 0
+    }
+
+    var j: int = 0
+    while j < g_workers {
+        thread_spawn(http_worker)
+        j = j + 1
+    }
+
+    thread_spawn(health_checker)
+
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            channel_send(g_proxy_ch, client)
+        }
+    }
+    return 0
+}

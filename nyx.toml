@@ -1,0 +1,13 @@
+[package]
+name = "nyx-proxy"
+version = "0.2.0"
+main = "examples/standalone.nx"
+description = "Reverse proxy library: TLS, SNI, rate limiting, health checks, access logs"
+
+# nyx-proxy is consumed as a library by concrete gateway projects.
+# See services/gateway/ for the production consumer that wraps this
+# library with TLS + SNI for nyxlang.com. Running `nyx build` from
+# this directory produces an HTTP-only reference binary built from
+# examples/standalone.nx, meant as a smoke test.
+
+[dependencies]

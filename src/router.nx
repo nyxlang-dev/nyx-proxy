@@ -1,0 +1,299 @@
+// router.nx — Route requests to correct upstream by path prefix
+// Uses longest-prefix matching, falls back to default upstream
+// Includes connection pooling to backends for keep-alive reuse
+
+import "std/http"
+import "std/proxy"
+
+// Connection pools: one array of fds per upstream (max 16 upstreams)
+var g_pools: Array = []
+var g_pool_mtx: Map = Map.new()
+var g_pools_init: int = 0
+
+fn pool_init() {
+    if g_pools_init == 1 { return 0 }
+    g_pool_mtx = mutex_new()
+    var i: int = 0
+    while i < 16 {
+        let pool: Array = []
+        g_pools.push(pool)
+        i = i + 1
+    }
+    g_pools_init = 1
+    return 0
+}
+
+// Get a fd from the pool for upstream idx, or open a new connection
+fn pool_get(idx: int, host: String, port: int) -> int {
+    mutex_lock(g_pool_mtx)
+    let pool: Array = g_pools[idx]
+    if pool.length() > 0 {
+        let fd: int = pool.pop()
+        mutex_unlock(g_pool_mtx)
+        return fd
+    }
+    mutex_unlock(g_pool_mtx)
+    // Pool empty — open new connection
+    let fd: int = tcp_connect(host, port)
+    return fd
+}
+
+// Return a fd to the pool (max 16 per upstream), or close it
+fn pool_put(idx: int, fd: int) {
+    mutex_lock(g_pool_mtx)
+    let pool: Array = g_pools[idx]
+    if pool.length() < 16 {
+        pool.push(fd)
+        mutex_unlock(g_pool_mtx)
+    } else {
+        mutex_unlock(g_pool_mtx)
+        tcp_close(fd)
+    }
+}
+
+// Discard a broken fd (don't return to pool)
+fn pool_discard(fd: int) {
+    tcp_close(fd)
+}
+
+// Forward request to backend using pooled connection
+fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
+    let fd: int = pool_get(idx, backend.host, backend.port)
+    if fd < 0 {
+        return http_response(502, "Bad Gateway: cannot connect to upstream")
+    }
+
+    // Build HTTP request to upstream
+    let crlf: String = "\r\n"
+    var req: String = method + " " + path + " HTTP/1.1" + crlf
+    req = req + "Host: " + backend.host + ":" + int_to_string(backend.port) + crlf
+
+    // Forward original headers (skip Host, Connection)
+    var hi: int = 0
+    while hi + 1 < headers.length() {
+        let hk: String = headers[hi]
+        let hv: String = headers[hi + 1]
+        if hk != "Host" and hk != "Connection" {
+            req = req + hk + ": " + hv + crlf
+        }
+        hi = hi + 2
+    }
+
+    req = req + "X-Forwarded-Proto: http" + crlf
+    req = req + "Connection: keep-alive" + crlf
+
+    if body.length() > 0 {
+        req = req + "Content-Length: " + int_to_string(str_byte_length(body)) + crlf
+    }
+
+    req = req + crlf + body
+
+    // Send to upstream
+    let written: int = tcp_write(fd, req)
+    if written <= 0 {
+        // Connection stale — discard and retry with new connection
+        pool_discard(fd)
+        let fd2: int = tcp_connect(backend.host, backend.port)
+        if fd2 < 0 {
+            return http_response(502, "Bad Gateway: cannot connect to upstream")
+        }
+        tcp_write(fd2, req)
+        return read_upstream_response(idx, fd2)
+    }
+
+    return read_upstream_response(idx, fd)
+}
+
+// Read response from upstream and return to pool
+fn read_upstream_response(upstream_idx: int, fd: int) -> String {
+    let status_line: String = tcp_read_line(fd)
+    if status_line.length() == 0 {
+        pool_discard(fd)
+        return http_response(502, "Bad Gateway: empty response from upstream")
+    }
+
+    // Read response headers
+    var resp_headers: Array = []
+    var content_length: int = 0
+    var upstream_closes: int = 0
+    while 1 > 0 {
+        let line: String = tcp_read_line(fd)
+        if line.length() == 0 {
+            break
+        }
+        let colon_idx: int = line.indexOf(": ")
+        if colon_idx >= 0 {
+            let key: String = line.substring(0, colon_idx)
+            let val: String = line.substring(colon_idx + 2, line.length())
+            resp_headers.push(key)
+            resp_headers.push(val)
+            if key == "Content-Length" {
+                content_length = string_to_int(val)
+            }
+            // Honor upstream's Connection: close — don't pool a fd the server
+            // is about to close. Without this the pool hands out dead fds on
+            // the next request, producing 502 "empty response from upstream"
+            // for every other request against HTTP/1.0-style backends.
+            if key == "Connection" and val == "close" {
+                upstream_closes = 1
+            }
+        }
+    }
+
+    // Read response body
+    var resp_body: String = ""
+    if content_length > 0 {
+        resp_body = tcp_read(fd, content_length)
+    }
+
+    // Return fd to pool for reuse — unless upstream is closing it
+    if upstream_closes == 1 {
+        pool_discard(fd)
+    } else {
+        pool_put(upstream_idx, fd)
+    }
+
+    // Build response to client
+    let crlf: String = "\r\n"
+    var response: String = status_line + crlf
+
+    var ri: int = 0
+    while ri + 1 < resp_headers.length() {
+        let rk: String = resp_headers[ri]
+        let rv: String = resp_headers[ri + 1]
+        if rk != "Connection" {
+            response = response + rk + ": " + rv + crlf
+        }
+        ri = ri + 2
+    }
+
+    response = response + "Connection: keep-alive" + crlf
+    response = response + crlf + resp_body
+
+    return response
+}
+
+// Detect MIME type from file extension
+fn detect_mime_type(file_path: String) -> String {
+    if file_path.endsWith(".css") { return "text/css; charset=utf-8" }
+    if file_path.endsWith(".js") { return "application/javascript; charset=utf-8" }
+    if file_path.endsWith(".svg") { return "image/svg+xml" }
+    if file_path.endsWith(".png") { return "image/png" }
+    if file_path.endsWith(".woff2") { return "font/woff2" }
+    if file_path.endsWith(".woff") { return "font/woff" }
+    if file_path.endsWith(".html") { return "text/html; charset=utf-8" }
+    if file_path.endsWith(".json") { return "application/json; charset=utf-8" }
+    return "application/octet-stream"
+}
+
+fn proxy_dispatch(raw: Array) -> String {
+    let method: String = raw[1]
+    let path: String = raw[2]
+    let headers: Array = raw[3]
+    let body: String = raw[4]
+
+    // Empty method = client disconnected
+    if method.length() == 0 {
+        return ""
+    }
+
+    // Initialize pools on first call
+    pool_init()
+
+    // Serve shared static assets directly (design system CSS, etc.)
+    if path.startsWith("/shared/") {
+        let file_path: String = "website" + path
+        let content: String = read_file(file_path)
+        if content.length() == 0 {
+            access_log(method, path, 404, 0)
+            return http_response(404, "Not Found")
+        }
+        let mime: String = detect_mime_type(file_path)
+        let crlf: String = "\r\n"
+        var resp: String = "HTTP/1.1 200 OK" + crlf
+        resp = resp + "Content-Type: " + mime + crlf
+        resp = resp + "Content-Length: " + int_to_string(str_byte_length(content)) + crlf
+        resp = resp + "Cache-Control: public, max-age=3600" + crlf
+        resp = resp + "Connection: keep-alive" + crlf
+        resp = resp + crlf + content
+        access_log(method, path, 200, 0)
+        return resp
+    }
+
+    // Virtual host routing: match Host header first
+    let host_header: String = http_find_header(headers, "Host")
+    // Strip port from Host header (e.g. "nyxkv.com:443" -> "nyxkv.com")
+    var host_name: String = host_header
+    let colon_pos: int = host_header.indexOf(":")
+    if colon_pos >= 0 {
+        host_name = host_header.substring(0, colon_pos)
+    }
+
+    var best_idx: int = -1
+    var best_len: int = 0
+
+    // Check virtual hosts
+    var vi: int = 0
+    while vi < g_vhost_count {
+        let vname: String = g_vhost_names[vi]
+        if vname == host_name {
+            best_idx = g_vhost_indices[vi]
+            break
+        }
+        vi = vi + 1
+    }
+
+    // If no vhost match, try longest prefix match
+    if best_idx < 0 {
+        var i: int = 0
+        while i < g_upstream_count {
+            let prefix: String = g_upstream_prefixes[i]
+            let plen: int = prefix.length()
+            if plen > 0 {
+                if path.startsWith(prefix) {
+                    if plen > best_len {
+                        best_idx = i
+                        best_len = plen
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // No prefix match -> use default upstream
+    if best_idx < 0 {
+        best_idx = g_default_upstream
+    }
+
+    if best_idx < 0 {
+        return http_response(503, "no upstream configured")
+    }
+
+    // Strip matched prefix from path for the backend
+    var forward_path: String = path
+    if best_len > 0 {
+        forward_path = path.substring(best_len, path.length())
+        if forward_path.length() == 0 {
+            forward_path = "/"
+        }
+    }
+
+    // Select backend (round-robin) and forward with pooled connection
+    let cfg: ProxyConfig = g_upstream_configs[best_idx]
+    let backend: Backend = select_backend(cfg)
+    let t0: int = time_epoch()
+    let resp: String = forward_pooled(best_idx, method, forward_path, headers, body, backend)
+    let t1: int = time_epoch()
+
+    // Parse status code from response for logging
+    var log_status: int = 0
+    if resp.length() > 12 {
+        // "HTTP/1.1 NNN" — status at positions 9-11
+        let status_str: String = resp.substring(9, 12)
+        log_status = string_to_int(status_str)
+    }
+    access_log(method, path, log_status, t1 - t0)
+
+    return resp
+}

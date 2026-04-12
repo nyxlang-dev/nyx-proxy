@@ -1,0 +1,6 @@
+nyx-proxy
+proxy.toml
+script.nx
+script.ll
+*.o
+.DS_Store
