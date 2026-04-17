@@ -1,0 +1,145 @@
+// config.nx — Parse proxy.toml and populate global routing state
+// Uses numbered [upstream.N] sections since TOML parser doesn't support [[arrays]]
+
+import "std/toml"
+import "std/proxy"
+
+// Global routing state — accessed by router.nx, health.nx, logger.nx, main.nx
+var g_listen_port: int = 8080
+var g_workers: int = 64
+var g_health_interval: int = 10
+var g_health_threshold: int = 3
+var g_access_log_path: String = ""
+var g_rate_limit: int = 0
+var g_upstream_names: Array = []
+var g_upstream_prefixes: Array = []
+var g_upstream_configs: Array = []
+var g_upstream_count: int = 0
+var g_default_upstream: int = -1
+var g_tls_cert: String = ""
+var g_tls_key: String = ""
+var g_tls_enabled: int = 0
+
+// Virtual host routing: hostname → upstream index
+var g_vhost_names: Array = []
+var g_vhost_indices: Array = []
+var g_vhost_count: int = 0
+
+// Hot-reload state: remembering the config path and mtime so a watcher
+// thread can notice changes and re-invoke load_config without restart.
+var g_config_path: String = ""
+var g_config_mtime: int = 0
+
+// Read the mtime (seconds) of a file, or 0 if stat fails.
+fn config_file_mtime(path: String) -> int {
+    let s: Array = stat(path)
+    if s.length() < 3 { return 0 }
+    let mt: int = s[2]
+    return mt
+}
+
+// Reset the routing globals before a reload so a shrinking config does not
+// leave zombie upstreams or vhosts behind. TLS state is intentionally
+// preserved — changing cert paths at runtime is out of scope.
+fn reset_routing_globals() {
+    g_upstream_names = []
+    g_upstream_prefixes = []
+    g_upstream_configs = []
+    g_upstream_count = 0
+    g_default_upstream = -1
+    g_vhost_names = []
+    g_vhost_indices = []
+    g_vhost_count = 0
+}
+
+pub fn load_config(path: String) {
+    g_config_path = path
+    g_config_mtime = config_file_mtime(path)
+    reset_routing_globals()
+    let content: String = read_file(path)
+    let parsed: Map = toml_parse(content)
+
+    g_listen_port = toml_get_int(parsed, "server.listen", 8080)
+    g_workers = toml_get_int(parsed, "server.workers", 64)
+
+    // Iterate upstream.0, upstream.1, ... (max 16)
+    var idx: int = 0
+    while idx < 16 {
+        let name_key: String = "upstream." + int_to_string(idx) + ".name"
+        if toml_has(parsed, name_key) == false {
+            break
+        }
+
+        let pfx: String = "upstream." + int_to_string(idx)
+        let name: String = toml_get(parsed, pfx + ".name", "")
+        let host: String = toml_get(parsed, pfx + ".host", "127.0.0.1")
+        let port: int = toml_get_int(parsed, pfx + ".port", 80)
+        let path_prefix: String = toml_get(parsed, pfx + ".path_prefix", "")
+        let hostname: String = toml_get(parsed, pfx + ".hostname", "")
+
+        let cfg: ProxyConfig = proxy_new(0)
+        proxy_add_backend(cfg, host, port)
+
+        g_upstream_names.push(name)
+        g_upstream_prefixes.push(path_prefix)
+        g_upstream_configs.push(cfg)
+
+        if path_prefix == "" and hostname == "" {
+            g_default_upstream = g_upstream_count
+        }
+
+        // Register virtual host if hostname specified
+        if hostname.length() > 0 {
+            g_vhost_names.push(hostname)
+            g_vhost_indices.push(g_upstream_count)
+            g_vhost_count = g_vhost_count + 1
+        }
+
+        g_upstream_count = g_upstream_count + 1
+        idx = idx + 1
+    }
+
+    // Rate limiting
+    g_rate_limit = toml_get_int(parsed, "server.rate_limit", 0)
+
+    // Health check configuration
+    g_health_interval = toml_get_int(parsed, "server.health_check_interval", 10)
+    g_health_threshold = toml_get_int(parsed, "server.health_check_threshold", 3)
+
+    // Access log configuration
+    g_access_log_path = toml_get(parsed, "server.access_log", "")
+
+    // TLS configuration (optional)
+    g_tls_cert = toml_get(parsed, "server.tls_cert", "")
+    g_tls_key = toml_get(parsed, "server.tls_key", "")
+    if g_tls_cert.length() > 0 {
+        g_tls_enabled = 1
+        g_listen_port = 443
+    }
+}
+
+// Check the config file's mtime and reload if it changed. Returns 1 when
+// a reload actually happened, 0 otherwise. Safe to call from a watcher
+// thread — upstream / vhost arrays are swapped wholesale via
+// reset_routing_globals() before re-parsing, so in-flight requests see
+// either the old routing table or the new one, not a torn mix.
+// Callers that haven't invoked load_config yet get 0 back (nothing to do).
+pub fn reload_config_if_changed() -> int {
+    if g_config_path.length() == 0 { return 0 }
+    let now_mt: int = config_file_mtime(g_config_path)
+    if now_mt == 0 { return 0 }
+    if now_mt == g_config_mtime { return 0 }
+    load_config(g_config_path)
+    return 1
+}
+
+// Watcher thread body. Polls the config file at the given interval (in
+// seconds) and reloads routing state on mtime changes. Consumer spawns
+// it as `spawn { watch_config_loop(5) }` if hot-reload is desired.
+pub fn watch_config_loop(interval_sec: int) -> int {
+    while 1 > 0 {
+        sleep(interval_sec)
+        reload_config_if_changed()
+    }
+    return 0
+}

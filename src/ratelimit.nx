@@ -1,0 +1,58 @@
+// ratelimit.nx — Per-IP rate limiting for nyx-proxy
+// Token bucket: each IP gets N tokens per second, each request costs 1 token
+
+var g_rl_counts: Map = map_new()    // IP → request count this window
+var g_rl_window: Map = map_new()    // IP → window start (epoch seconds)
+var g_rl_mtx: Map = Map.new()
+var g_rl_init: int = 0
+
+fn rl_init() {
+    if g_rl_init == 1 { return 0 }
+    g_rl_mtx = mutex_new()
+    g_rl_init = 1
+    return 0
+}
+
+// Check if request from this IP should be allowed.
+// Returns "" if allowed, or HTTP 429 response if rate limited.
+pub fn proxy_check_rate(ip: String) -> String {
+    if g_rate_limit == 0 { return "" }
+    rl_init()
+
+    let now: int = time_epoch() / 1000000  // seconds
+
+    mutex_lock(g_rl_mtx)
+
+    var count: int = 0
+    var window: int = 0
+
+    if g_rl_window.contains(ip) {
+        window = g_rl_window.get(ip)
+        count = g_rl_counts.get(ip)
+    }
+
+    if now != window {
+        // New second window — reset
+        g_rl_window.insert(ip, now)
+        g_rl_counts.insert(ip, 1)
+        mutex_unlock(g_rl_mtx)
+        return ""
+    }
+
+    if count >= g_rate_limit {
+        mutex_unlock(g_rl_mtx)
+        let crlf: String = "\r\n"
+        let body: String = "429 Too Many Requests"
+        var resp: String = "HTTP/1.1 429 Too Many Requests" + crlf
+        resp = resp + "Content-Length: " + int_to_string(body.length()) + crlf
+        resp = resp + "Content-Type: text/plain" + crlf
+        resp = resp + "Retry-After: 1" + crlf
+        resp = resp + "Connection: keep-alive" + crlf
+        resp = resp + crlf + body
+        return resp
+    }
+
+    g_rl_counts.insert(ip, count + 1)
+    mutex_unlock(g_rl_mtx)
+    return ""
+}
