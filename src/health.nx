@@ -1,0 +1,65 @@
+// health.nx — Background health checker for nyx-proxy
+// Periodically TCP-connects to each backend, marks unhealthy after N failures
+
+// Failure counters per upstream, per backend (flat: upstream_idx * 16 + backend_idx)
+var g_fail_counts: Array = []
+var g_health_init: int = 0
+
+fn health_init() {
+    if g_health_init == 1 { return 0 }
+    // Pre-allocate failure counters (max 16 upstreams * 16 backends = 256)
+    var i: int = 0
+    while i < 256 {
+        g_fail_counts.push(0)
+        i = i + 1
+    }
+    g_health_init = 1
+    return 0
+}
+
+// Background health checker thread
+pub fn health_checker() -> int {
+    health_init()
+    sleep(5000)  // Wait 5s for backends to start
+
+    while 1 > 0 {
+        var ui: int = 0
+        while ui < g_upstream_count {
+            let cfg: ProxyConfig = g_upstream_configs[ui]
+            var bi: int = 0
+            while bi < cfg.backends.length() {
+                let b: Backend = cfg.backends[bi]
+                let fd: int = tcp_connect(b.host, b.port)
+                let slot: int = ui * 16 + bi
+
+                if fd >= 0 {
+                    // Success: reset counter, mark healthy
+                    tcp_close(fd)
+                    g_fail_counts[slot] = 0
+                    let was_unhealthy: bool = cfg.healthy[bi]
+                    if was_unhealthy == false {
+                        cfg.healthy[bi] = true
+                        print("[health] " + b.host + ":" + int_to_string(b.port) + " recovered")
+                    }
+                } else {
+                    // Failure: increment counter
+                    let count: int = g_fail_counts[slot]
+                    let new_count: int = count + 1
+                    g_fail_counts[slot] = new_count
+                    if new_count >= g_health_threshold {
+                        let was_healthy: bool = cfg.healthy[bi]
+                        if was_healthy {
+                            cfg.healthy[bi] = false
+                            print("[health] " + b.host + ":" + int_to_string(b.port) + " marked unhealthy (" + int_to_string(new_count) + " failures)")
+                        }
+                    }
+                }
+                bi = bi + 1
+            }
+            ui = ui + 1
+        }
+
+        sleep(g_health_interval * 1000)
+    }
+    return 0
+}

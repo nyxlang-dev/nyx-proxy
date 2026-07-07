@@ -1,0 +1,404 @@
+// cache.nx — Response cache LRU por-host con TTL.
+//
+// Almacena respuestas HTTP completas (status + headers + body ya
+// serializados como String) indexadas por "HOST:PATH". LRU via doubly-
+// linked list logico sobre arrays paralelos; todas las operaciones son
+// O(1) bajo un mutex global.
+//
+// Cache-Control del upstream:
+//   - no-store / no-cache / private -> no cachea
+//   - max-age=N                     -> TTL = N segundos
+//   - ausente                       -> TTL = g_cache_default_ttl_s
+
+import "std/http"
+
+var g_cache_enabled: int = 0
+var g_cache_max_entries: int = 0
+var g_cache_default_ttl_s: int = 0
+
+// Parallel slot arrays. valid[i]=1 si el slot aloja un entry, 0 si esta libre.
+var g_cache_keys: Array = []
+var g_cache_responses: Array = []
+var g_cache_expires: Array = []     // epoch millis
+var g_cache_prev: Array = []
+var g_cache_next: Array = []
+var g_cache_valid: Array = []
+
+// key -> slot index
+var g_cache_map: Map = Map.new()
+
+// LRU pointers en arrays de 1 elem (mutables desde funciones).
+var g_cache_head: Array = []        // [idx | -1]
+var g_cache_tail: Array = []        // [idx | -1]
+var g_cache_size: Array = []        // [count]
+var g_cache_free: Array = []        // stack de indices libres
+
+// Counters locales (el modulo metrics los lee via cache_snapshot).
+var g_cache_hits: Array = []
+var g_cache_misses: Array = []
+var g_cache_evicts: Array = []
+
+var g_cache_mtx: Map = Map.new()
+var g_cache_init_done: int = 0
+
+pub fn cache_init(max_entries: int, default_ttl_s: int) {
+    if g_cache_init_done == 1 { return 0 }
+    if max_entries <= 0 { return 0 }
+    g_cache_mtx = mutex_new()
+    g_cache_max_entries = max_entries
+    g_cache_default_ttl_s = default_ttl_s
+    g_cache_enabled = 1
+    var i: int = 0
+    while i < max_entries {
+        g_cache_keys.push("")
+        g_cache_responses.push("")
+        g_cache_expires.push(0)
+        g_cache_prev.push(-1)
+        g_cache_next.push(-1)
+        g_cache_valid.push(0)
+        // stack: pop() retorna LIFO, llenamos al revés para entregar 0 primero
+        g_cache_free.push(max_entries - 1 - i)
+        i = i + 1
+    }
+    g_cache_head.push(-1)
+    g_cache_tail.push(-1)
+    g_cache_size.push(0)
+    g_cache_hits.push(0)
+    g_cache_misses.push(0)
+    g_cache_evicts.push(0)
+    g_cache_init_done = 1
+    return 0
+}
+
+// Desconectar idx de la lista doblemente enlazada.
+fn _lru_unlink(idx: int) {
+    let p: int = g_cache_prev[idx]
+    let n: int = g_cache_next[idx]
+    if p >= 0 {
+        g_cache_next[p] = n
+    } else {
+        g_cache_head[0] = n
+    }
+    if n >= 0 {
+        g_cache_prev[n] = p
+    } else {
+        g_cache_tail[0] = p
+    }
+    g_cache_prev[idx] = -1
+    g_cache_next[idx] = -1
+    return 0
+}
+
+fn _lru_link_head(idx: int) {
+    let h: int = g_cache_head[0]
+    g_cache_prev[idx] = -1
+    g_cache_next[idx] = h
+    if h >= 0 {
+        g_cache_prev[h] = idx
+    }
+    g_cache_head[0] = idx
+    if g_cache_tail[0] < 0 {
+        g_cache_tail[0] = idx
+    }
+    return 0
+}
+
+fn _lru_move_to_head(idx: int) {
+    if g_cache_head[0] == idx { return 0 }
+    _lru_unlink(idx)
+    _lru_link_head(idx)
+    return 0
+}
+
+// Libera un slot: saca la key del map, limpia arrays paralelos, lo deja
+// disponible en el stack free. Asume que el caller ya hizo _lru_unlink.
+fn _slot_free(idx: int) {
+    let key: String = g_cache_keys[idx]
+    if key.length() > 0 {
+        g_cache_map.remove(key)
+    }
+    g_cache_keys[idx] = ""
+    g_cache_responses[idx] = ""
+    g_cache_expires[idx] = 0
+    g_cache_valid[idx] = 0
+    g_cache_free.push(idx)
+    g_cache_size[0] = g_cache_size[0] - 1
+    return 0
+}
+
+fn _evict_tail() {
+    let t: int = g_cache_tail[0]
+    if t < 0 { return 0 }
+    _lru_unlink(t)
+    _slot_free(t)
+    g_cache_evicts[0] = g_cache_evicts[0] + 1
+    return 0
+}
+
+pub fn cache_lookup(host: String, path: String) -> String {
+    if g_cache_enabled == 0 { return "" }
+    let key: String = host + ":" + path
+    mutex_lock(g_cache_mtx)
+    if g_cache_map.contains(key) == false {
+        g_cache_misses[0] = g_cache_misses[0] + 1
+        mutex_unlock(g_cache_mtx)
+        return ""
+    }
+    let idx: int = g_cache_map.get(key)
+    let now_ms: int = time_ms()
+    if now_ms > g_cache_expires[idx] {
+        // Expirado — invalida inline y cuenta como miss.
+        _lru_unlink(idx)
+        _slot_free(idx)
+        g_cache_misses[0] = g_cache_misses[0] + 1
+        mutex_unlock(g_cache_mtx)
+        return ""
+    }
+    let resp: String = g_cache_responses[idx]
+    _lru_move_to_head(idx)
+    g_cache_hits[0] = g_cache_hits[0] + 1
+    mutex_unlock(g_cache_mtx)
+    return resp
+}
+
+// Busca needle a partir de un offset en haystack. indexOf builtin solo
+// toma un arg, asi que re-basamos con substring.
+// OJO: substring/indexOf operan sobre BYTES, pero length() cuenta
+// codepoints UTF-8 — para rebanar siempre byte_length(), o el slice
+// trunca el final cuando el string tiene caracteres multi-byte.
+fn _indexof_at(haystack: String, needle: String, start: int) -> int {
+    if start >= haystack.byte_length() { return -1 }
+    let tail: String = haystack.substring(start, haystack.byte_length())
+    let rel: int = tail.indexOf(needle)
+    if rel < 0 { return -1 }
+    return rel + start
+}
+
+fn _cc_contains_directive(cc: String, needle: String) -> int {
+    if cc.indexOf(needle) >= 0 { return 1 }
+    return 0
+}
+
+// Extrae N de "max-age=N". -1 si ausente o invalido.
+fn _parse_max_age(cc: String) -> int {
+    let pos: int = cc.indexOf("max-age=")
+    if pos < 0 { return -1 }
+    var p: int = pos + 8
+    let n: int = cc.length()
+    var digits: String = ""
+    while p < n {
+        let c: String = cc.substring(p, p + 1)
+        if c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9" {
+            digits = digits + c
+            p = p + 1
+        } else {
+            break
+        }
+    }
+    if digits.length() == 0 { return -1 }
+    return string_to_int(digits)
+}
+
+// Lee el valor del header Cache-Control directamente del String de la
+// respuesta HTTP. Prueba casing comun y lowercase. Devuelve "" si no esta.
+fn _extract_cache_control(resp: String) -> String {
+    var key: String = "Cache-Control:"
+    var pos: int = resp.indexOf(key)
+    if pos < 0 {
+        key = "cache-control:"
+        pos = resp.indexOf(key)
+    }
+    if pos < 0 { return "" }
+    let start: int = pos + key.length()
+    let line_end: int = _indexof_at(resp, "\r\n", start)
+    if line_end < 0 { return "" }
+    var val: String = resp.substring(start, line_end)
+    // trim leading space
+    if val.length() > 0 {
+        if val.substring(0, 1) == " " {
+            val = val.substring(1, val.byte_length())
+        }
+    }
+    return val
+}
+
+// Parsea status de "HTTP/1.1 NNN ". 0 si no se puede.
+fn _extract_status(resp: String) -> int {
+    if resp.length() < 12 { return 0 }
+    let s: String = resp.substring(9, 12)
+    return string_to_int(s)
+}
+
+// Intenta cachear el response. Parsea status + Cache-Control internamente.
+// Retorna 1 si se guardo, 0 en caso contrario.
+pub fn cache_try_store(host: String, path: String, response: String) -> int {
+    if g_cache_enabled == 0 { return 0 }
+    if response.length() < 16 { return 0 }
+
+    let status: int = _extract_status(response)
+    if status != 200 { return 0 }
+
+    let cc: String = _extract_cache_control(response)
+    if _cc_contains_directive(cc, "no-store") == 1 { return 0 }
+    if _cc_contains_directive(cc, "no-cache") == 1 { return 0 }
+    if _cc_contains_directive(cc, "private") == 1 { return 0 }
+
+    var ttl_s: int = g_cache_default_ttl_s
+    let max_age: int = _parse_max_age(cc)
+    if max_age >= 0 { ttl_s = max_age }
+    if ttl_s <= 0 { return 0 }
+
+    let key: String = host + ":" + path
+    let now_ms: int = time_ms()
+    let expires_ms: int = now_ms + ttl_s * 1000
+
+    mutex_lock(g_cache_mtx)
+    if g_cache_map.contains(key) {
+        let idx: int = g_cache_map.get(key)
+        g_cache_responses[idx] = response
+        g_cache_expires[idx] = expires_ms
+        _lru_move_to_head(idx)
+        mutex_unlock(g_cache_mtx)
+        return 1
+    }
+    if g_cache_size[0] >= g_cache_max_entries {
+        _evict_tail()
+    }
+    if g_cache_free.length() == 0 {
+        mutex_unlock(g_cache_mtx)
+        return 0
+    }
+    let slot: int = g_cache_free.pop()
+    g_cache_keys[slot] = key
+    g_cache_responses[slot] = response
+    g_cache_expires[slot] = expires_ms
+    g_cache_valid[slot] = 1
+    g_cache_map.insert(key, slot)
+    _lru_link_head(slot)
+    g_cache_size[0] = g_cache_size[0] + 1
+    mutex_unlock(g_cache_mtx)
+    return 1
+}
+
+// Marca un response cacheado con X-Nyx-Cache: HIT antes del CRLFCRLF.
+// Util para observar hits desde curl -D -.
+pub fn cache_mark_hit(resp: String) -> String {
+    let sep: String = "\r\n\r\n"
+    let pos: int = resp.indexOf(sep)
+    if pos < 0 { return resp }
+    let head: String = resp.substring(0, pos)
+    // byte_length, NO length(): con body multi-byte, length() (codepoints)
+    // queda corto y el slice pierde los ultimos bytes del body con
+    // Content-Length intacto — el "off-by-8" que desactivo el cache en prod.
+    let tail: String = resp.substring(pos, resp.byte_length())
+    return head + "\r\nX-Nyx-Cache: HIT" + tail
+}
+
+// ─────────────────────────────────────────────
+// Single-flight coalescing (v0.4)
+// ─────────────────────────────────────────────
+// Evita el thundering herd: cuando N workers piden la misma key fria
+// simultaneamente, uno solo va al backend y los demas esperan a que ese
+// termine y sirven desde cache. Si el fetcher falla o el no-cacheable,
+// los waiters caen al backend por su cuenta (degradacion benigna).
+
+var g_sf_pending: Map = Map.new()   // key -> 0=fetching, 1=ready
+var g_sf_mtx: Map = Map.new()
+var g_sf_init_done: int = 0
+
+var g_sf_waits: Array = []          // counter waits realizados
+var g_sf_timeouts: Array = []       // counter waits que expiraron
+
+fn sf_init() {
+    if g_sf_init_done == 1 { return 0 }
+    g_sf_mtx = mutex_new()
+    g_sf_waits.push(0)
+    g_sf_timeouts.push(0)
+    g_sf_init_done = 1
+    return 0
+}
+
+// Retorna 1 si el caller debe ir al backend (claim del slot).
+// Retorna 0 si otro thread ya esta fetcheando (el caller debe llamar a
+// singleflight_wait + relookup).
+pub fn singleflight_claim(host: String, path: String) -> int {
+    if g_cache_enabled == 0 { return 1 }
+    sf_init()
+    let key: String = host + ":" + path
+    mutex_lock(g_sf_mtx)
+    if g_sf_pending.contains(key) {
+        mutex_unlock(g_sf_mtx)
+        return 0
+    }
+    g_sf_pending.insert(key, 0)
+    mutex_unlock(g_sf_mtx)
+    return 1
+}
+
+// Poll hasta max_ms esperando a que la key se resuelva. Si el fetcher
+// almaceno la respuesta en cache, la devuelve. "" si timeout o el
+// fetcher descarto (no-cacheable).
+pub fn singleflight_wait(host: String, path: String, max_ms: int) -> String {
+    if g_cache_enabled == 0 { return "" }
+    sf_init()
+    mutex_lock(g_sf_mtx)
+    g_sf_waits[0] = g_sf_waits[0] + 1
+    mutex_unlock(g_sf_mtx)
+
+    let key: String = host + ":" + path
+    let start_ms: int = time_ms()
+    var elapsed: int = 0
+    while elapsed < max_ms {
+        mutex_lock(g_sf_mtx)
+        var still_pending: int = 0
+        if g_sf_pending.contains(key) { still_pending = 1 }
+        mutex_unlock(g_sf_mtx)
+        if still_pending == 0 {
+            // Fetcher ya libero el slot — relookup cache.
+            return cache_lookup(host, path)
+        }
+        sleep(10)
+        elapsed = (time_ms()) - start_ms
+    }
+    mutex_lock(g_sf_mtx)
+    g_sf_timeouts[0] = g_sf_timeouts[0] + 1
+    mutex_unlock(g_sf_mtx)
+    return ""
+}
+
+// Libera el slot de inflight, despertando waiters implicitamente (via poll).
+pub fn singleflight_release(host: String, path: String) {
+    if g_cache_enabled == 0 { return 0 }
+    sf_init()
+    let key: String = host + ":" + path
+    mutex_lock(g_sf_mtx)
+    if g_sf_pending.contains(key) {
+        g_sf_pending.remove(key)
+    }
+    mutex_unlock(g_sf_mtx)
+    return 0
+}
+
+// Snapshot adicional para metrics: [waits, timeouts].
+pub fn singleflight_snapshot() -> Array {
+    if g_sf_init_done == 0 {
+        let empty: Array = [0, 0]
+        return empty
+    }
+    mutex_lock(g_sf_mtx)
+    let snap: Array = [g_sf_waits[0], g_sf_timeouts[0]]
+    mutex_unlock(g_sf_mtx)
+    return snap
+}
+
+// Snapshot para /metrics: [size, hits, misses, evictions, max_entries].
+pub fn cache_snapshot() -> Array {
+    if g_cache_init_done == 0 {
+        let empty: Array = [0, 0, 0, 0, 0]
+        return empty
+    }
+    mutex_lock(g_cache_mtx)
+    let snap: Array = [g_cache_size[0], g_cache_hits[0], g_cache_misses[0], g_cache_evicts[0], g_cache_max_entries]
+    mutex_unlock(g_cache_mtx)
+    return snap
+}

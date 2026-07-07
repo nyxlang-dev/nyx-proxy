@@ -1,0 +1,72 @@
+// admin.nx — Listener HTTP dedicado para /metrics y /healthz.
+//
+// Se escucha en g_metrics_bind:g_metrics_port (default 127.0.0.1:9090).
+// Un solo thread; el volumen esperado es bajo (scraping cada 15-60s).
+// No comparte el channel de workers del proxy para que el listener
+// principal siga sirviendo trafico si algun scrape se cuelga.
+
+import "std/http"
+import "src/metrics"
+
+fn _send_plain(client: int, status_line: String, status: int, body: String) {
+    let crlf: String = "\r\n"
+    var resp: String = status_line + crlf
+    resp = resp + "Content-Type: text/plain; version=0.0.4; charset=utf-8" + crlf
+    resp = resp + "Content-Length: " + int_to_string(str_byte_length(body)) + crlf
+    resp = resp + "Connection: close" + crlf
+    resp = resp + crlf + body
+    tcp_write(client, resp)
+    return 0
+}
+
+fn _handle_admin_client(client: int) {
+    let line: String = tcp_read_line(client)
+    if line.length() == 0 { return 0 }
+
+    // Drena el resto de headers hasta linea vacia.
+    var done: int = 0
+    while done == 0 {
+        let h: String = tcp_read_line(client)
+        if h.length() == 0 { done = 1 }
+    }
+
+    let parts: Array = line.split(" ")
+    if parts.length() < 2 { return 0 }
+    let method: String = parts[0]
+    let path: String = parts[1]
+    if method != "GET" {
+        _send_plain(client, "HTTP/1.1 405 Method Not Allowed", 405, "method not allowed\n")
+        return 0
+    }
+    if path == "/metrics" {
+        let body: String = metrics_render()
+        _send_plain(client, "HTTP/1.1 200 OK", 200, body)
+        return 0
+    }
+    if path == "/healthz" {
+        _send_plain(client, "HTTP/1.1 200 OK", 200, "ok\n")
+        return 0
+    }
+    _send_plain(client, "HTTP/1.1 404 Not Found", 404, "not found\n")
+    return 0
+}
+
+// Entrypoint del thread admin. Lee g_metrics_bind / g_metrics_port
+// (populados por load_config) y entra en el accept loop.
+pub fn admin_worker() -> int {
+    if g_metrics_enabled == 0 { return 0 }
+    let server: int = tcp_listen(g_metrics_bind, g_metrics_port)
+    if server < 0 {
+        print("[admin] WARNING: cannot listen on " + g_metrics_bind + ":" + int_to_string(g_metrics_port))
+        return 0
+    }
+    print("[admin] /metrics listener on " + g_metrics_bind + ":" + int_to_string(g_metrics_port))
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            _handle_admin_client(client)
+            tcp_close(client)
+        }
+    }
+    return 0
+}

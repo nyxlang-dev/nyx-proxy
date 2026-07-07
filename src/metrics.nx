@@ -1,0 +1,316 @@
+// metrics.nx — Prometheus-style counters para nyx-proxy.
+//
+// Todos los counters estan bajo un mutex unico para evitar torn reads
+// entre labels emparentados. Para renderizar, toma una snapshot bajo
+// lock y serializa fuera del lock.
+
+import "src/cache"
+
+// g_metrics_enabled / g_metrics_bind / g_metrics_port viven en config.nx
+// para que sean accesibles desde admin.nx y el entrypoint sin ciclos.
+
+// requests_total: key = "host|class" donde class in 2xx,3xx,4xx,5xx,other
+var g_m_requests: Map = Map.new()
+
+// upstream_latency_ms_sum / count: key = host
+var g_m_lat_sum: Map = Map.new()
+var g_m_lat_count: Map = Map.new()
+
+// Histograma de upstream latency. key = "host|bucket_idx", value = count
+// NO cumulativo en storage — la cumulacion se hace al renderizar para
+// evitar N writes por observacion (escribimos solo el bucket exacto).
+var g_m_lat_buckets: Map = Map.new()
+
+// Buckets de latencia en ms. 11 finitos + +Inf implicito (= _count total).
+// Mirror de los defaults de client_golang para interop con dashboards
+// comunes.
+fn _lat_bucket_count() -> int { return 11 }
+fn _lat_bucket_le(idx: int) -> int {
+    if idx == 0  { return 1 }
+    if idx == 1  { return 5 }
+    if idx == 2  { return 10 }
+    if idx == 3  { return 25 }
+    if idx == 4  { return 50 }
+    if idx == 5  { return 100 }
+    if idx == 6  { return 250 }
+    if idx == 7  { return 500 }
+    if idx == 8  { return 1000 }
+    if idx == 9  { return 2500 }
+    if idx == 10 { return 5000 }
+    return -1
+}
+
+// ratelimit_rejects_total: key = host
+var g_m_ratelimit: Map = Map.new()
+
+// Epoch de arranque en ms — para emitir uptime_seconds.
+var g_m_start_ms: Array = []
+
+var g_metrics_mtx: Map = Map.new()
+var g_metrics_init_done: int = 0
+
+pub fn metrics_init() {
+    if g_metrics_init_done == 1 { return 0 }
+    g_metrics_mtx = mutex_new()
+    g_m_start_ms.push(time_epoch() / 1000)
+    g_metrics_init_done = 1
+    return 0
+}
+
+fn _status_class(status: int) -> String {
+    if status >= 500 { return "5xx" }
+    if status >= 400 { return "4xx" }
+    if status >= 300 { return "3xx" }
+    if status >= 200 { return "2xx" }
+    return "other"
+}
+
+fn _bump(m: Map, key: String, delta: int) {
+    var cur: int = 0
+    if m.contains(key) { cur = m.get(key) }
+    m.insert(key, cur + delta)
+    return 0
+}
+
+// Selecciona el bucket exacto (menor idx tal que latency_ms <= le). Si
+// cae en +Inf retorna _lat_bucket_count() (se refleja solo via _count).
+fn _lat_bucket_idx(latency_ms: int) -> int {
+    let n: int = _lat_bucket_count()
+    var idx: int = 0
+    while idx < n {
+        if latency_ms <= _lat_bucket_le(idx) { return idx }
+        idx = idx + 1
+    }
+    return n
+}
+
+pub fn metrics_record_request(host: String, status: int, latency_us: int, cache_hit: int) {
+    if g_metrics_init_done == 0 { return 0 }
+    let cls: String = _status_class(status)
+    let rkey: String = host + "|" + cls
+    let latency_ms: int = latency_us / 1000
+
+    mutex_lock(g_metrics_mtx)
+    _bump(g_m_requests, rkey, 1)
+    // Solo contabilizamos upstream latency cuando NO es hit — un hit de
+    // cache no toca al backend y contaminaria el percentil con tiempos de lookup.
+    if cache_hit == 0 {
+        _bump(g_m_lat_sum, host, latency_ms)
+        _bump(g_m_lat_count, host, 1)
+        let b: int = _lat_bucket_idx(latency_ms)
+        if b < _lat_bucket_count() {
+            let bkey: String = host + "|" + int_to_string(b)
+            _bump(g_m_lat_buckets, bkey, 1)
+        }
+    }
+    mutex_unlock(g_metrics_mtx)
+    return 0
+}
+
+pub fn metrics_record_ratelimit_reject(host: String) {
+    if g_metrics_init_done == 0 { return 0 }
+    mutex_lock(g_metrics_mtx)
+    _bump(g_m_ratelimit, host, 1)
+    mutex_unlock(g_metrics_mtx)
+    return 0
+}
+
+// Construye el payload Prometheus text (exposition format 0.0.4).
+// Todo el snapshot se copia bajo lock, luego se serializa sin lock.
+pub fn metrics_render() -> String {
+    if g_metrics_init_done == 0 { return "" }
+
+    mutex_lock(g_metrics_mtx)
+    let req_keys: Array = g_m_requests.keys()
+    var req_vals: Array = []
+    var ri: int = 0
+    while ri < req_keys.length() {
+        let rk: String = req_keys[ri]
+        req_vals.push(g_m_requests.get(rk))
+        ri = ri + 1
+    }
+
+    let lat_keys: Array = g_m_lat_sum.keys()
+    var lat_sums: Array = []
+    var lat_counts: Array = []
+    // bucket_counts[host_idx] = [c0, c1, ..., c(n-1)] — raw (no cumulativo)
+    var bucket_counts: Array = []
+    let nbuckets: int = _lat_bucket_count()
+    var li: int = 0
+    while li < lat_keys.length() {
+        let lk: String = lat_keys[li]
+        lat_sums.push(g_m_lat_sum.get(lk))
+        var cnt: int = 0
+        if g_m_lat_count.contains(lk) {
+            cnt = g_m_lat_count.get(lk)
+        }
+        lat_counts.push(cnt)
+        var row: Array = []
+        var bi: int = 0
+        while bi < nbuckets {
+            let bkey: String = lk + "|" + int_to_string(bi)
+            var bv: int = 0
+            if g_m_lat_buckets.contains(bkey) { bv = g_m_lat_buckets.get(bkey) }
+            row.push(bv)
+            bi = bi + 1
+        }
+        bucket_counts.push(row)
+        li = li + 1
+    }
+
+    let rl_keys: Array = g_m_ratelimit.keys()
+    var rl_vals: Array = []
+    var rki: int = 0
+    while rki < rl_keys.length() {
+        let rlk: String = rl_keys[rki]
+        rl_vals.push(g_m_ratelimit.get(rlk))
+        rki = rki + 1
+    }
+    let start_ms: int = g_m_start_ms[0]
+    mutex_unlock(g_metrics_mtx)
+
+    let cache_stats: Array = cache_snapshot()
+    let cache_size: int = cache_stats[0]
+    let cache_hits: int = cache_stats[1]
+    let cache_misses: int = cache_stats[2]
+    let cache_evicts: int = cache_stats[3]
+    let cache_max: int = cache_stats[4]
+
+    let sf_stats: Array = singleflight_snapshot()
+    let sf_waits: int = sf_stats[0]
+    let sf_timeouts: int = sf_stats[1]
+
+    let now_ms: int = time_epoch() / 1000
+    let uptime_s: int = (now_ms - start_ms) / 1000
+
+    var sb: StringBuilder = StringBuilder.new()
+
+    sb.append("# HELP nyx_proxy_requests_total Total HTTP requests processed by the proxy.\n")
+    sb.append("# TYPE nyx_proxy_requests_total counter\n")
+    var i: int = 0
+    while i < req_keys.length() {
+        let k: String = req_keys[i]
+        let rv: int = req_vals[i]
+        let bar: int = k.indexOf("|")
+        var host: String = k
+        var cls: String = "other"
+        if bar >= 0 {
+            host = k.substring(0, bar)
+            cls = k.substring(bar + 1, k.length())
+        }
+        sb.append("nyx_proxy_requests_total{host=\"")
+        sb.append(host)
+        sb.append("\",status=\"")
+        sb.append(cls)
+        sb.append("\"} ")
+        sb.append(int_to_string(rv))
+        sb.append("\n")
+        i = i + 1
+    }
+
+    sb.append("# HELP nyx_proxy_cache_hits_total Cache lookups that served a hit.\n")
+    sb.append("# TYPE nyx_proxy_cache_hits_total counter\n")
+    sb.append("nyx_proxy_cache_hits_total ")
+    sb.append(int_to_string(cache_hits))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_cache_misses_total Cache lookups that missed (includes TTL expirations).\n")
+    sb.append("# TYPE nyx_proxy_cache_misses_total counter\n")
+    sb.append("nyx_proxy_cache_misses_total ")
+    sb.append(int_to_string(cache_misses))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_cache_evictions_total Entries evicted due to capacity pressure.\n")
+    sb.append("# TYPE nyx_proxy_cache_evictions_total counter\n")
+    sb.append("nyx_proxy_cache_evictions_total ")
+    sb.append(int_to_string(cache_evicts))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_cache_size Current entries held in the response cache.\n")
+    sb.append("# TYPE nyx_proxy_cache_size gauge\n")
+    sb.append("nyx_proxy_cache_size ")
+    sb.append(int_to_string(cache_size))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_cache_capacity Configured max entries in the response cache.\n")
+    sb.append("# TYPE nyx_proxy_cache_capacity gauge\n")
+    sb.append("nyx_proxy_cache_capacity ")
+    sb.append(int_to_string(cache_max))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_upstream_latency_ms Upstream latency histogram in milliseconds, by host.\n")
+    sb.append("# TYPE nyx_proxy_upstream_latency_ms histogram\n")
+    var j: int = 0
+    while j < lat_keys.length() {
+        let lhost: String = lat_keys[j]
+        let lsv: int = lat_sums[j]
+        let lcv: int = lat_counts[j]
+        let row: Array = bucket_counts[j]
+        // Emitir buckets cumulativos — Prometheus requiere que cada bucket
+        // incluya las observaciones de buckets anteriores.
+        var cum: int = 0
+        var bi: int = 0
+        while bi < nbuckets {
+            cum = cum + row[bi]
+            sb.append("nyx_proxy_upstream_latency_ms_bucket{host=\"")
+            sb.append(lhost)
+            sb.append("\",le=\"")
+            sb.append(int_to_string(_lat_bucket_le(bi)))
+            sb.append("\"} ")
+            sb.append(int_to_string(cum))
+            sb.append("\n")
+            bi = bi + 1
+        }
+        // +Inf siempre = count total (todo lo observado).
+        sb.append("nyx_proxy_upstream_latency_ms_bucket{host=\"")
+        sb.append(lhost)
+        sb.append("\",le=\"+Inf\"} ")
+        sb.append(int_to_string(lcv))
+        sb.append("\n")
+        sb.append("nyx_proxy_upstream_latency_ms_sum{host=\"")
+        sb.append(lhost)
+        sb.append("\"} ")
+        sb.append(int_to_string(lsv))
+        sb.append("\n")
+        sb.append("nyx_proxy_upstream_latency_ms_count{host=\"")
+        sb.append(lhost)
+        sb.append("\"} ")
+        sb.append(int_to_string(lcv))
+        sb.append("\n")
+        j = j + 1
+    }
+
+    sb.append("# HELP nyx_proxy_ratelimit_rejects_total 429 responses sent by the rate limiter, by host.\n")
+    sb.append("# TYPE nyx_proxy_ratelimit_rejects_total counter\n")
+    var rk: int = 0
+    while rk < rl_keys.length() {
+        let rhost: String = rl_keys[rk]
+        let rvn: int = rl_vals[rk]
+        sb.append("nyx_proxy_ratelimit_rejects_total{host=\"")
+        sb.append(rhost)
+        sb.append("\"} ")
+        sb.append(int_to_string(rvn))
+        sb.append("\n")
+        rk = rk + 1
+    }
+
+    sb.append("# HELP nyx_proxy_singleflight_waits_total Requests that waited on another concurrent fetch instead of hitting the backend.\n")
+    sb.append("# TYPE nyx_proxy_singleflight_waits_total counter\n")
+    sb.append("nyx_proxy_singleflight_waits_total ")
+    sb.append(int_to_string(sf_waits))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_singleflight_timeouts_total Single-flight waits that gave up before the fetcher completed.\n")
+    sb.append("# TYPE nyx_proxy_singleflight_timeouts_total counter\n")
+    sb.append("nyx_proxy_singleflight_timeouts_total ")
+    sb.append(int_to_string(sf_timeouts))
+    sb.append("\n")
+
+    sb.append("# HELP nyx_proxy_uptime_seconds Seconds since the proxy process started.\n")
+    sb.append("# TYPE nyx_proxy_uptime_seconds gauge\n")
+    sb.append("nyx_proxy_uptime_seconds ")
+    sb.append(int_to_string(uptime_s))
+    sb.append("\n")
+
+    return sb.to_string()
+}

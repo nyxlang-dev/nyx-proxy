@@ -1,0 +1,48 @@
+// logger.nx — Access logging for nyx-proxy
+// Format: timestamp method path status latency_ms
+// Writes to file configured via access_log in proxy.toml
+
+var g_log_mtx: Map = Map.new()
+var g_log_init: int = 0
+var g_log_enabled: int = 0
+
+fn log_init() {
+    if g_log_init == 1 { return 0 }
+    g_log_mtx = mutex_new()
+    if g_access_log_path.length() > 0 {
+        g_log_enabled = 1
+        print("[logger] access log: " + g_access_log_path)
+    }
+    g_log_init = 1
+    return 0
+}
+
+// Log a request. Call from router after getting the response.
+pub fn access_log(method: String, path: String, status: int, latency_us: int) {
+    log_init()
+    if g_log_enabled == 0 { return 0 }
+
+    let latency_ms: int = latency_us / 1000
+    let ts: int = time_epoch() / 1000000
+
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append(int_to_string(ts))
+    sb.append(" ")
+    sb.append(method)
+    sb.append(" ")
+    sb.append(path)
+    sb.append(" ")
+    sb.append(int_to_string(status))
+    sb.append(" ")
+    sb.append(int_to_string(latency_ms))
+    sb.append("ms\n")
+
+    let line: String = sb.to_string()
+
+    mutex_lock(g_log_mtx)
+    let f: File = file_open(g_access_log_path, "a")
+    file_write_string(f, line)
+    file_close(f)
+    mutex_unlock(g_log_mtx)
+    return 0
+}
