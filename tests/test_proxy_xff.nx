@@ -1,0 +1,65 @@
+// test_proxy_xff.nx — Unit tests para inject_forwarded_headers (sin network).
+// Correr con NYX_PROJECT_DIR=products/proxy (router.nx importa "src/...").
+//
+// Semántica: X-Real-IP entrante se DESCARTA (spoofeable) y se pone la IP
+// real del peer; X-Forwarded-For entrante se preserva y se appendea la IP.
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+fn find_header(headers: Array, key: String) -> String {
+    var i: int = 0
+    while i + 1 < headers.length() {
+        let hk: String = headers[i]
+        if hk == key {
+            let hv: String = headers[i + 1]
+            return hv
+        }
+        i = i + 2
+    }
+    return ""
+}
+
+fn main() -> int {
+    // Caso 1: request limpio — agrega ambos headers con la IP del peer
+    let h1 = ["Host", "nyxlang.com", "Accept", "*/*"]
+    let out1 = inject_forwarded_headers(h1, "203.0.113.9")
+    assert(find_header(out1, "X-Forwarded-For") == "203.0.113.9")
+    assert(find_header(out1, "X-Real-IP") == "203.0.113.9")
+    assert(find_header(out1, "Host") == "nyxlang.com")
+    assert(find_header(out1, "Accept") == "*/*")
+
+    // Caso 2: XFF entrante (cadena de proxies) — se APPENDEA la IP del peer
+    let h2 = ["Host", "a.com", "X-Forwarded-For", "198.51.100.7"]
+    let out2 = inject_forwarded_headers(h2, "203.0.113.9")
+    assert(find_header(out2, "X-Forwarded-For") == "198.51.100.7, 203.0.113.9")
+
+    // Caso 3: X-Real-IP entrante (spoofeado) — se DESCARTA y gana el peer
+    let h3 = ["X-Real-IP", "10.0.0.66", "Host", "b.com"]
+    let out3 = inject_forwarded_headers(h3, "203.0.113.9")
+    assert(find_header(out3, "X-Real-IP") == "203.0.113.9")
+
+    // Caso 4: case-insensitive en los entrantes
+    let h4 = ["x-forwarded-for", "192.0.2.1", "x-real-ip", "10.9.9.9"]
+    let out4 = inject_forwarded_headers(h4, "203.0.113.9")
+    assert(find_header(out4, "X-Forwarded-For") == "192.0.2.1, 203.0.113.9")
+    assert(find_header(out4, "X-Real-IP") == "203.0.113.9")
+
+    // Caso 5: los headers inyectados no duplican los entrantes
+    var xff_count: int = 0
+    var i: int = 0
+    while i + 1 < out4.length() {
+        let hk: String = out4[i]
+        if hk.toLower() == "x-forwarded-for" { xff_count = xff_count + 1 }
+        i = i + 2
+    }
+    assert(xff_count == 1)
+
+    print("test_proxy_xff: 10 asserts OK")
+    return 0
+}

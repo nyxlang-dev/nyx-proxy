@@ -304,6 +304,7 @@ pub fn cache_mark_hit(resp: String) -> String {
 
 var g_sf_pending: Map = Map.new()   // key -> 0=fetching, 1=ready
 var g_sf_mtx: Map = Map.new()
+var g_sf_cv: Map = Map.new()        // condvar pareada SIEMPRE con g_sf_mtx
 var g_sf_init_done: int = 0
 
 var g_sf_waits: Array = []          // counter waits realizados
@@ -312,6 +313,7 @@ var g_sf_timeouts: Array = []       // counter waits que expiraron
 fn sf_init() {
     if g_sf_init_done == 1 { return 0 }
     g_sf_mtx = mutex_new()
+    g_sf_cv = condvar_new()
     g_sf_waits.push(0)
     g_sf_timeouts.push(0)
     g_sf_init_done = 1
@@ -335,38 +337,44 @@ pub fn singleflight_claim(host: String, path: String) -> int {
     return 1
 }
 
-// Poll hasta max_ms esperando a que la key se resuelva. Si el fetcher
-// almaceno la respuesta en cache, la devuelve. "" si timeout o el
-// fetcher descarto (no-cacheable).
+// Espera hasta max_ms a que la key se resuelva, bloqueada en la condvar
+// (sin busy-poll). Si el fetcher almaceno la respuesta en cache, la
+// devuelve. "" si timeout o el fetcher descarto (no-cacheable).
+//
+// Todo el loop corre bajo g_sf_mtx (contrato pthread: condvar_wait/
+// timedwait EXIGEN el mutex tomado al llamar). Se re-chequea el predicado
+// SIEMPRE al volver de cada wait — hay spurious wakeups Y el broadcast de
+// singleflight_release despierta a TODOS los waiters de TODAS las keys
+// sobre esta cv compartida, no solo los de la key que se libero.
 pub fn singleflight_wait(host: String, path: String, max_ms: int) -> String {
     if g_cache_enabled == 0 { return "" }
     sf_init()
     mutex_lock(g_sf_mtx)
     g_sf_waits[0] = g_sf_waits[0] + 1
-    mutex_unlock(g_sf_mtx)
 
     let key: String = host + ":" + path
     let start_ms: int = time_ms()
-    var elapsed: int = 0
-    while elapsed < max_ms {
-        mutex_lock(g_sf_mtx)
-        var still_pending: int = 0
-        if g_sf_pending.contains(key) { still_pending = 1 }
-        mutex_unlock(g_sf_mtx)
-        if still_pending == 0 {
-            // Fetcher ya libero el slot — relookup cache.
-            return cache_lookup(host, path)
-        }
-        sleep(10)
-        elapsed = (time_ms()) - start_ms
+    var remaining: int = max_ms
+    while g_sf_pending.contains(key) && remaining > 0 {
+        condvar_timedwait(g_sf_cv, g_sf_mtx, remaining)
+        remaining = max_ms - (time_ms() - start_ms)
     }
-    mutex_lock(g_sf_mtx)
-    g_sf_timeouts[0] = g_sf_timeouts[0] + 1
+
+    if g_sf_pending.contains(key) {
+        // Siguio pendiente tras agotar el presupuesto: timeout real.
+        g_sf_timeouts[0] = g_sf_timeouts[0] + 1
+        mutex_unlock(g_sf_mtx)
+        return ""
+    }
     mutex_unlock(g_sf_mtx)
-    return ""
+    // Fetcher ya libero el slot — relookup cache.
+    return cache_lookup(host, path)
 }
 
-// Libera el slot de inflight, despertando waiters implicitamente (via poll).
+// Libera el slot de inflight y despierta a TODOS los waiters (broadcast:
+// hay waiters de keys DISTINTAS compartiendo la misma condvar — un signal
+// simple podria despertar a uno equivocado y dejar dormido al que
+// corresponde a esta key).
 pub fn singleflight_release(host: String, path: String) {
     if g_cache_enabled == 0 { return 0 }
     sf_init()
@@ -375,6 +383,7 @@ pub fn singleflight_release(host: String, path: String) {
     if g_sf_pending.contains(key) {
         g_sf_pending.remove(key)
     }
+    condvar_broadcast(g_sf_cv)
     mutex_unlock(g_sf_mtx)
     return 0
 }

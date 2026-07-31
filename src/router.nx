@@ -96,9 +96,16 @@ pub fn inject_forwarded_headers(headers: Array, client_ip: String) -> Array {
 
 // Forward request to backend using pooled connection
 fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
-    let fd: int = pool_get(idx, backend.host, backend.port)
+    var fd: int = pool_get(idx, backend.host, backend.port)
     if fd < 0 {
-        return http_response(502, "Bad Gateway: cannot connect to upstream")
+        // Fallo de conexion INICIAL (pool vacio y tcp_connect fallo dentro
+        // de pool_get) — el upstream nunca llego a recibir nada, asi que
+        // reintentar con una conexion fresca es seguro para CUALQUIER
+        // metodo (a diferencia del caso status-line-vacia mas abajo).
+        fd = tcp_connect(backend.host, backend.port)
+        if fd < 0 {
+            return http_response(502, "Bad Gateway: cannot connect to upstream")
+        }
     }
 
     // Build HTTP request to upstream
@@ -130,24 +137,59 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
     let written: int = tcp_write(fd, req)
     if written <= 0 {
         // Connection stale — discard and retry with new connection
+        // (write-fail: el upstream nunca vio el request, retry seguro
+        // para cualquier metodo — caso (b), ya existia).
         pool_discard(fd)
         let fd2: int = tcp_connect(backend.host, backend.port)
         if fd2 < 0 {
             return http_response(502, "Bad Gateway: cannot connect to upstream")
         }
         tcp_write(fd2, req)
-        return read_upstream_response(idx, fd2)
+        let res2: Array = read_upstream_response(idx, fd2)
+        return res2[0]
     }
 
-    return read_upstream_response(idx, fd)
+    let res: Array = read_upstream_response(idx, fd)
+    let resp: String = res[0]
+    let was_stale: int = res[1]
+    if was_stale == 1 {
+        // Status-line vacia: no se leyo NI UN byte de vuelta. Post-restart
+        // del upstream esto es el caso tipico (la conexion pooled murio
+        // entre requests). Retry con conexion fresca SOLO para metodos
+        // idempotentes (GET/HEAD/OPTIONS) — por contrato HTTP no tienen
+        // side effects, asi que reenviar el mismo request es seguro. Un
+        // POST/PUT/PATCH/DELETE cuya respuesta quedo vacia PUDO haberse
+        // ejecutado en el upstream antes de que este muriera; reintentarlo
+        // arriesga una doble ejecucion (ej. doble cobro, doble insert) —
+        // se prefiere devolver el 502 real y dejar que el cliente decida.
+        if method == "GET" or method == "HEAD" or method == "OPTIONS" {
+            let fd3: int = tcp_connect(backend.host, backend.port)
+            if fd3 < 0 {
+                return resp
+            }
+            let written3: int = tcp_write(fd3, req)
+            if written3 <= 0 {
+                pool_discard(fd3)
+                return resp
+            }
+            let res3: Array = read_upstream_response(idx, fd3)
+            return res3[0]
+        }
+        return resp
+    }
+    return resp
 }
 
-// Read response from upstream and return to pool
-fn read_upstream_response(upstream_idx: int, fd: int) -> String {
+// Read response from upstream. Retorna [response, was_stale] — was_stale=1
+// cuando la status-line vino vacia (NI UN byte leido: conexion pooled
+// muerta, tipico post-restart del upstream) para que forward_pooled pueda
+// distinguirlo de un 502 real que el backend efectivamente respondio.
+fn read_upstream_response(upstream_idx: int, fd: int) -> Array {
     let status_line: String = tcp_read_line(fd)
     if status_line.length() == 0 {
         pool_discard(fd)
-        return http_response(502, "Bad Gateway: empty response from upstream")
+        let stale_resp: String = http_response(502, "Bad Gateway: empty response from upstream")
+        return [stale_resp, 1]
     }
 
     // Read response headers
@@ -208,7 +250,7 @@ fn read_upstream_response(upstream_idx: int, fd: int) -> String {
     response = response + "Connection: keep-alive" + crlf
     response = response + crlf + resp_body
 
-    return response
+    return [response, 0]
 }
 
 // Detect MIME type from file extension
@@ -286,18 +328,66 @@ fn resolve_upstream_idx(host_name: String, path: String) -> Array {
 // Túnel bidireccional cliente(TLS) ↔ upstream(TCP) hasta que un lado cierre.
 // 1 thread para upstream→cliente (closure capturando los handles), inline para
 // cliente→upstream. Cuando el cliente cierra, shutdown del upstream desbloquea el
-// thread. Teardown TLS best-effort: si el upstream cierra primero, el read TLS
-// inline puede colgar hasta que el cliente mande algo (no hay shutdown TLS
-// concurrente seguro sobre un SSL en uso).
+// thread.
+//
+// Lock SSL poll-then-lock (RESUELVE la limitación piloto que documentaba esta
+// función: SSL_read/SSL_write concurrentes sin lock sobre el mismo SSL*).
+// `ssl_mtx` serializa el acceso al SSL* entre el writer (up_to_client, bajo
+// lock) y el reader (loop inline). El reader NUNCA toma el lock para un read
+// potencialmente bloqueante: primero `tls_wait_readable` SIN el lock — pero
+// OJO, "sin lock" no es "no toca el SSL*": internamente llama SSL_pending()
+// y SSL_get_fd() sobre el mismo `ssl_handle` que el writer puede estar
+// usando bajo `ssl_mtx` en simultaneo (runtime/tls.c). Es seguro igual porque
+// ambas son lecturas de solo el LADO RECEPTOR del SSL* (SSL_pending mira el
+// buffer de bytes ya decodificados que llega por el read-path, SSL_get_fd
+// solo lee un puntero fijo del struct) — ninguna toca el estado de escritura
+// (SSL_write) que usa el writer, asi que no hay carrera real, solo ausencia
+// de serializacion formal sobre un dato que el writer nunca muta. Recien si
+// `tls_wait_readable` dice "hay algo" el reader toma el lock para
+// un `tls_read_nonblock` (garantizado no-bloqueante) antes de soltarlo. Bajo
+// el lock SOLO van operaciones no-bloqueantes (tls_read_nonblock /
+// tls_write_conn) — un tls_read_partial (bloqueante) bajo el lock
+// dead-lockearia al writer si el wakeup de poll() resulta ser solo un
+// record de control TLS 1.3 (p.ej. NewSessionTicket post-handshake) sin
+// datos de aplicación detrás: el SSL_read subsiguiente se quedaria
+// esperando mas bytes CON el lock tomado. Caveat documentado en
+// runtime/tls.c (nyx_tls_wait_readable / nyx_tls_read_nonblock).
+//
+// El flag `up_closed` (closure sobre un Array de 1 elemento, seteado por el
+// writer al ver EOF del upstream) destraba el cuelgue "upstream cierra
+// primero": antes, si el upstream cerraba antes que el cliente, el reader
+// inline quedaba bloqueado indefinidamente en un read TLS esperando algo
+// del cliente, sin enterarse nunca de que ya no habia adonde reenviarlo.
+// Ahora el reader hace poll con timeout (1s) y revisa el flag en cada
+// timeout, asi que sale del loop apenas el writer termino. El simetrico
+// "cliente cierra primero" (FIN del lado TLS) ya no depende de este flag: lo
+// resuelve el runtime — `tls_wait_readable` ahora detecta EOF real del peer
+// (via el flag `h->eof` que setea `tls_read_nonblock` al ver close_notify o
+// un error fatal) y devuelve -1 DETERMINISTICO en vez de reportar POLLIN
+// para siempre, asi que el `else` (-1) del loop de abajo corta sin
+// busy-spin apenas el cliente termina (review final pre-push, monorepo
+// runtime/tls.c).
 fn ws_tunnel(ssl_handle: int, up_fd: int) {
+    let ssl_mtx: Map = mutex_new()
+    // Flag cross-thread SIN lock/atomic dedicado (lector: este loop;
+    // escritor: up_to_client abajo) — benigno: es un int word-aligned (sin
+    // torn writes en ARM64/x86-64), se escribe UNA sola vez (0->1, nunca
+    // vuelve a 0) y se relee en cada timeout de poll de 1s del loop de abajo,
+    // asi que en el peor caso una lectura stale retrasa la salida del loop un
+    // ciclo (~1s), nunca lo corrompe ni lo cuelga indefinidamente.
+    var up_closed: Array = [0]
+
     fn up_to_client() -> int {
         var done: int = 0
         while done == 0 {
             let s: String = tcp_read_partial(up_fd, 65536)
             if s.length() == 0 {
                 done = 1
+                up_closed[0] = 1
             } else {
+                mutex_lock(ssl_mtx)
                 tls_write_conn(ssl_handle, s)
+                mutex_unlock(ssl_mtx)
             }
         }
         return 0
@@ -306,18 +396,33 @@ fn ws_tunnel(ssl_handle: int, up_fd: int) {
 
     var cdone: int = 0
     while cdone == 0 {
-        let s: String = tls_read_partial(ssl_handle, 65536)
-        if s.length() == 0 {
-            cdone = 1
+        let w: int = tls_wait_readable(ssl_handle, 1000)
+        if w == 1 {
+            mutex_lock(ssl_mtx)
+            let s: String = tls_read_nonblock(ssl_handle, 65536)
+            mutex_unlock(ssl_mtx)
+            if s.length() > 0 {
+                tcp_write(up_fd, s)
+            }
+            // s == "" -> el wakeup era solo un record de control TLS (o un
+            // WANT_READ del nonblock) sin datos de aplicacion; la muerte
+            // real de la conexion la detecta el -1 del proximo wait, o el
+            // proximo write al upstream. Volver a esperar.
+        } else if w == 0 {
+            if up_closed[0] == 1 {
+                cdone = 1
+            }
+            // si no, el timeout es normal (nada que leer todavia) — seguir
+            // esperando.
         } else {
-            tcp_write(up_fd, s)
+            // -1: conexion muerta / HUP sin data.
+            cdone = 1
         }
     }
-    // Cliente cerró: shutdown del upstream desbloquea el read del thread relay;
-    // join garantiza que ese thread terminó de escribir al SSL ANTES de cerrarlo
-    // (evita SSL_free concurrente con SSL_write). Nota: durante el túnel hay
-    // SSL_read (inline) y SSL_write (relay) concurrentes sobre el mismo SSL —
-    // aceptable en la fase de datos WS (sin renegociación); limitación de piloto.
+    // Cliente (o upstream) determino el fin: shutdown del upstream desbloquea
+    // el read del thread relay si seguia esperando datos; join garantiza que
+    // ese thread terminó de escribir al SSL ANTES de cerrarlo (evita SSL_free
+    // concurrente con SSL_write).
     tcp_shutdown(up_fd, 2)
     thread_join(tid)
     tcp_close(up_fd)

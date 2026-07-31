@@ -1,0 +1,77 @@
+// test_proxy_metrics.nx — Unit tests para histograms de latencia Prometheus.
+//
+// Ejercita metrics_record_request con latencias sinteticas y verifica
+// que el render produce buckets cumulativos + sum/count consistentes.
+
+// Se compila con NYX_PROJECT_DIR=products/proxy (imports relativos al proxy).
+import "src/metrics"
+
+fn contains(haystack: String, needle: String) -> bool {
+    return haystack.indexOf(needle) >= 0
+}
+
+fn test_histogram_type_header() {
+    metrics_init()
+    let out: String = metrics_render()
+    assert(contains(out, "# TYPE nyx_proxy_upstream_latency_ms histogram"))
+    print("PASS: TYPE header declara histogram")
+}
+
+fn test_bucket_cumulativo() {
+    metrics_init()
+    // Tres observaciones en host="h.test": 3 ms, 40 ms, 600 ms.
+    // bucket(le=1)=0, (le=5)=1, (le=10)=1, (le=25)=1, (le=50)=2,
+    // (le=100)=2, (le=250)=2, (le=500)=2, (le=1000)=3, (le=+Inf)=3.
+    // NOTA: latency_us, no latency_ms → multiplicar por 1000.
+    metrics_record_request("h.test", 200, 3 * 1000, 0)
+    metrics_record_request("h.test", 200, 40 * 1000, 0)
+    metrics_record_request("h.test", 200, 600 * 1000, 0)
+
+    let out: String = metrics_render()
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"h.test\",le=\"1\"} 0"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"h.test\",le=\"5\"} 1"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"h.test\",le=\"50\"} 2"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"h.test\",le=\"1000\"} 3"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"h.test\",le=\"+Inf\"} 3"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_count{host=\"h.test\"} 3"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_sum{host=\"h.test\"} 643"))
+    print("PASS: buckets cumulativos + sum/count consistentes")
+}
+
+fn test_cache_hit_no_contamina() {
+    metrics_init()
+    // Un hit de cache NO debe mover el histograma de upstream latency.
+    // Guardo la linea de count para "hh.test" antes y despues.
+    // (metric se registra con host vacio si nunca hubo miss; uso un host
+    // fresco.)
+    metrics_record_request("hh.test", 200, 500 * 1000, 1)  // cache hit
+    let out: String = metrics_render()
+    // No deberia existir entrada de bucket para hh.test porque
+    // _lat_buckets solo se toca en miss (cache_hit=0).
+    let has_row: bool = contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"hh.test\"")
+    assert(has_row == false)
+    print("PASS: cache hit no emite buckets (contaminacion evitada)")
+}
+
+fn test_infty_bucket_catches_outliers() {
+    metrics_init()
+    // 10 segundos — mas alla del bucket finito maximo (5000 ms).
+    // Debe contar solo en +Inf; los buckets finitos quedan en 0.
+    metrics_record_request("slow.test", 200, 10000 * 1000, 0)
+    let out: String = metrics_render()
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"slow.test\",le=\"5000\"} 0"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_bucket{host=\"slow.test\",le=\"+Inf\"} 1"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_count{host=\"slow.test\"} 1"))
+    assert(contains(out, "nyx_proxy_upstream_latency_ms_sum{host=\"slow.test\"} 10000"))
+    print("PASS: outliers caen solo en +Inf")
+}
+
+fn main() {
+    test_histogram_type_header()
+    test_bucket_cumulativo()
+    test_cache_hit_no_contamina()
+    test_infty_bucket_catches_outliers()
+    print("")
+    print("ALL nyx-proxy metrics tests passed")
+    return 0
+}

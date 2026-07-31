@@ -1,0 +1,115 @@
+// test_proxy_retry.nx — Unit tests para retry-on-stale (502 breves tras
+// restart de upstream). Levanta listeners TCP locales reales (no mocks) para
+// simular una conexión pooled que murió: el servidor acepta, drena la
+// request line (evita que el write del cliente falle por RST prematuro,
+// que caeria en el camino write-fail existente en vez del que probamos
+// acá) y cierra SIN responder — status-line vacía del lado del cliente.
+//
+// Correr con NYX_PROJECT_DIR=<stack> (router.nx importa "src/...").
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+// ── Caso 1: read_upstream_response distingue stale de 502 real ────────────
+
+var g_srv_stale: Array = [0]
+
+fn accept_close_thread() -> int {
+    let c: int = tcp_accept(g_srv_stale[0])
+    tcp_read_line(c)
+    tcp_close(c)
+    return 0
+}
+
+fn test_read_upstream_response_stale() {
+    let srv: int = tcp_listen("127.0.0.1", 19347)
+    g_srv_stale[0] = srv
+    let tid: int = thread_spawn(accept_close_thread)
+    let fd: int = tcp_connect("127.0.0.1", 19347)
+    assert(fd >= 0)
+    tcp_write(fd, "GET / HTTP/1.1\r\n\r\n")
+    let res: Array = read_upstream_response(0, fd)
+    let resp: String = res[0]
+    let was_stale: int = res[1]
+    thread_join(tid)
+    tcp_close(srv)
+    assert(was_stale == 1)
+    assert(resp.indexOf("502") >= 0)
+    print("PASS: read_upstream_response senala was_stale=1 en status-line vacia")
+}
+
+// ── Caso 2: forward_pooled reintenta GET (idempotente) y recupera 200 ─────
+
+var g_srv_retry: Array = [0]
+
+fn upstream_retry_thread() -> int {
+    // 1ra conexion: simula el upstream muerto — acepta, drena la request,
+    // cierra sin responder.
+    let c1: int = tcp_accept(g_srv_retry[0])
+    tcp_read_line(c1)
+    tcp_close(c1)
+    // 2da conexion: la del retry — responde 200 real.
+    let c2: int = tcp_accept(g_srv_retry[0])
+    tcp_read_line(c2)
+    tcp_write(c2, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    tcp_close(c2)
+    return 0
+}
+
+fn test_forward_pooled_retry_get() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19348)
+    g_srv_retry[0] = srv
+    let tid: int = thread_spawn(upstream_retry_thread)
+    let backend: Backend = Backend { host: "127.0.0.1", port: 19348 }
+    let headers: Array = ["Host", "test"]
+    let resp: String = forward_pooled(1, "GET", "/", headers, "", backend)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(resp.indexOf("200") >= 0)
+    assert(resp.indexOf("ok") >= 0)
+    print("PASS: forward_pooled reintenta GET tras status-line vacia y recupera 200")
+}
+
+// ── Caso 3: forward_pooled NO reintenta POST (evita doble ejecucion) ──────
+
+var g_srv_nopost: Array = [0]
+
+fn upstream_nopost_thread() -> int {
+    let c1: int = tcp_accept(g_srv_nopost[0])
+    tcp_read_line(c1)
+    tcp_close(c1)
+    // Cierra el listener tambien: si forward_pooled reintentara (bug), el
+    // 2do tcp_connect debe fallar RAPIDO (cannot connect) en vez de colgarse
+    // esperando un accept() que nunca llega — el test falla, no cuelga.
+    tcp_close(g_srv_nopost[0])
+    return 0
+}
+
+fn test_forward_pooled_no_retry_post() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19349)
+    g_srv_nopost[0] = srv
+    let tid: int = thread_spawn(upstream_nopost_thread)
+    let backend: Backend = Backend { host: "127.0.0.1", port: 19349 }
+    let headers: Array = ["Host", "test"]
+    let resp: String = forward_pooled(2, "POST", "/", headers, "{}", backend)
+    thread_join(tid)
+    assert(resp.indexOf("502") >= 0)
+    assert(resp.indexOf("empty response") >= 0)
+    print("PASS: forward_pooled NO reintenta POST tras status-line vacia (evita doble ejecucion)")
+}
+
+fn main() -> int {
+    test_read_upstream_response_stale()
+    test_forward_pooled_retry_get()
+    test_forward_pooled_no_retry_post()
+    print("")
+    print("ALL nyx-proxy retry-on-stale tests passed")
+    return 0
+}

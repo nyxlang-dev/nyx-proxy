@@ -3,6 +3,37 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.0 — 2026-07-19
+
+**Arranque del roadmap v0.4.0: single-flight con condvar, retry-on-stale,
+lock SSL del túnel WS.** Usa builtins nuevos del toolchain (`condvar_*`,
+`tls_wait_readable`, `tls_read_nonblock` — monorepo commits e7ead96 /
+26ea0ee / 50d74a3).
+
+- `src/cache.nx`: single-flight (`singleflight_wait`) dejó de hacer
+  busy-poll de 10ms y pasó a bloquearse en una condvar (`g_sf_cv`,
+  pareada con `g_sf_mtx`). `singleflight_release` hace
+  `condvar_broadcast` bajo el mutex al liberar el slot (broadcast, no
+  signal — hay waiters de keys distintas compartiendo la misma cv).
+  Latencia de wakeup: de hasta 10ms de polling a prácticamente
+  instantánea. Semántica de contadores/timeout/snapshot preservada.
+- `src/router.nx`: `read_upstream_response` ahora distingue "conexión
+  pooled murió" (status-line vacía, was_stale=1) de un 502 real que
+  respondió el backend. `forward_pooled` reintenta UNA vez con conexión
+  fresca en fallo de conexión inicial (cualquier método) y en
+  status-line vacía SOLO para métodos idempotentes (GET/HEAD/OPTIONS —
+  un POST pudo haberse ejecutado antes de morir el upstream, reintentarlo
+  arriesga doble ejecución). Reduce los 502 breves característicos de un
+  restart de upstream.
+- `src/router.nx`: `ws_tunnel` resuelve la limitación piloto de
+  SSL_read/SSL_write concurrentes sin lock sobre el mismo `SSL*` — patrón
+  poll-then-lock (`tls_wait_readable` sin lock + `tls_read_nonblock` bajo
+  lock, nunca un read bloqueante bajo el lock). De paso destraba el
+  cuelgue "upstream cierra primero" (flag `up_closed` + poll con timeout).
+  Verificado con el E2E real del monorepo (`test_ws_proxy.py`, 6/6).
+- Tests nuevos: `test_singleflight_condvar_wakeup` (cache),
+  `tests/test_proxy_retry.nx` (3 casos, listeners TCP reales).
+
 ## v0.3.1 — 2026-04-24
 
 **Bug fix: vhost match cortocircuitaba path_prefix bajo el mismo host.**

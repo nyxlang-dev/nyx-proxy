@@ -1,7 +1,9 @@
 nyx-proxy
-proxy.toml
 script.nx
 script.ll
+script_bin
+nyx.lock
 packages/
 *.o
 .DS_Store
+CLAUDE.local.md
