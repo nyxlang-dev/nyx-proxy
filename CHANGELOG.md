@@ -3,6 +3,40 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.1 — 2026-08-01
+
+**El camino HTTPS existe fuera de producción: tutorial + ejemplo real
+`gateway-tls`, y la doc deja de mentir.**
+
+- `examples/gateway-tls/` — gateway HTTPS multi-dominio COMPLETO como proyecto
+  autocontenido que consume nyx-proxy vía PM (`nyx.toml` → `packages/`): TLS +
+  SNI (cert default + `tls_server_add_cert` por dominio), workers keep-alive
+  con rate-limit antes del dispatch, passthrough WebSocket, redirect
+  HTTP→HTTPS, health checker y `/metrics`+`/healthz` por loopback. Certs
+  self-signed gitignorados (one-liners en `certs/README.md`). Verificado E2E
+  9/9 antes de publicarse (vhosts por SNI, fallback, 301, healthz, metrics,
+  cache hit, 429).
+- `docs/TUTORIAL.md` + `TUTORIAL.es.md` — walkthrough completo: certs locales,
+  build, sondas curl de cada feature, y producción (certbot, unit systemd con
+  `CAP_NET_BIND_SERVICE` en vez de root). Cada comando fue ejecutado antes de
+  escribirse.
+- `src/config.nx` — **fix**: un `server.listen` explícito ya no es pisado por
+  el 443 que implica TLS; el 443 queda como default solo cuando `listen` no
+  está en el config. Habilita gateways TLS sin root (el ejemplo escucha 8443).
+  Suite nueva `test_proxy_config_listen` (3 casos, RED verificado).
+- README/CONFIG.md — reparados contra el código real: el `proxy.toml` de
+  ejemplo usaba claves inexistentes (`[vhost.N]`, `[health] interval_ms`,
+  `[rate]`, `[logging]`) y el snippet llamaba funciones inexistentes
+  (`health_start`, `proxy_listen`); Limitations negaba WebSocket y
+  single-flight (implementados desde v0.4.0); CONFIG.md afirmaba un redirect
+  :80 automático, un fallback `127.0.0.1:3000` y health checks por `GET
+  /health` que no existen (son TCP-connect). CONFIG.md gana `[cache]` y
+  `[metrics]`. El puntero muerto a `services/gateway/` (muerto desde el split
+  del monorepo) apunta ahora a `examples/gateway-tls/`.
+- CI — compila también el ejemplo TLS en cada push, con `packages/` sembrado
+  del checkout actual (el puntero muerto sobrevivió años porque ningún
+  automatismo compilaba el camino TLS).
+
 ## v0.4.0 — 2026-07-19
 
 **Arranque del roadmap v0.4.0: single-flight con condvar, retry-on-stale,
