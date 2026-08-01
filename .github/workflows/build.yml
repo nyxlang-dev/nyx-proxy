@@ -38,3 +38,20 @@ jobs:
           fi
           echo "✓ Binary $BIN produced successfully"
           ls -lh "./$BIN"
+
+      # El ejemplo TLS/SNI también compila en cada push. Sin este paso, el
+      # camino TLS quedaba sin compilar por nadie — así sobrevivió años un
+      # puntero muerto a services/gateway/. Se pre-siembra packages/ con el
+      # checkout ACTUAL (no un clone de red, que traería main y taparía
+      # regresiones del PR).
+      - name: Build gateway-tls example
+        run: |
+          cd examples/gateway-tls
+          mkdir -p packages/nyx-proxy
+          cp -r ../../src ../../nyx.toml packages/nyx-proxy/
+          nyx build
+          if [ ! -x ./gateway-tls ]; then
+              echo "ERROR: examples/gateway-tls did not build"
+              exit 1
+          fi
+          echo "✓ gateway-tls example builds"

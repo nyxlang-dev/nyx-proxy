@@ -14,8 +14,9 @@
 //   nyx build     -> produces ./nyx-proxy (a fully functional HTTP proxy
 //                    that reads proxy.toml from the current directory)
 //
-// See services/gateway/ for a real production consumer that adds TLS +
-// SNI + :80 redirect on top of this same library.
+// See examples/gateway-tls/ for the real HTTPS consumer that adds TLS +
+// SNI + HTTP->HTTPS redirect on top of this same library (walkthrough in
+// docs/TUTORIAL.md).
 
 import "std/http"
 import "std/proxy"
@@ -102,9 +103,8 @@ fn main() {
 
     if g_tls_enabled == 1 {
         print("nyx-proxy standalone example: TLS is configured in proxy.toml")
-        print("but this example does not register SNI certs. For a real")
-        print("HTTPS deployment, copy this file and add tls_server_add_cert()")
-        print("calls before entering the accept loop — see services/gateway/.")
+        print("but this example is the plain-HTTP one. For HTTPS + SNI use")
+        print("examples/gateway-tls/ (walkthrough in docs/TUTORIAL.md).")
         return 0
     }
 

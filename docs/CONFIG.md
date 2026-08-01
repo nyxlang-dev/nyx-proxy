@@ -8,12 +8,20 @@ Configuration is read from `proxy.toml` in the working directory at startup.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `listen` | int | `8080` | Port to listen on |
-| `workers` | int | `64` | Number of worker goroutines |
-| `tls_cert` | string | — | Path to TLS certificate (PEM). Required for TLS mode. |
+| `listen` | int | `8080` | Port to listen on. With TLS enabled it defaults to `443` instead — an **explicit** `listen` always wins (v0.4.1+), which lets a TLS gateway run unprivileged (e.g. `8443`). |
+| `workers` | int | `64` | Number of worker threads |
+| `rate_limit` | int | `0` | Requests/second per client IP; `0` disables. Rejections answer `429` with `Retry-After`. |
+| `health_check_interval` | int | `10` | Seconds between TCP health checks per backend |
+| `health_check_threshold` | int | `3` | Consecutive failures before a backend is marked unhealthy |
+| `access_log` | string | `""` | Path for the access log; empty disables |
+| `tls_cert` | string | — | Path to TLS certificate (PEM). Setting it enables TLS mode. |
 | `tls_key` | string | — | Path to TLS private key (PEM). Required for TLS mode. |
 
-When `tls_cert` and `tls_key` are set, TLS mode is enabled and nyx-proxy also starts an HTTP→HTTPS redirect listener on port 80.
+Setting `tls_cert`/`tls_key` enables TLS mode in the config globals. The
+accept loop, SNI certificate registration and any HTTP→HTTPS redirect
+listener are the **consumer's** code, not the library's — see
+[`examples/gateway-tls/`](../examples/gateway-tls/) and
+[TUTORIAL.md](TUTORIAL.md) for a full working gateway that does all three.
 
 ---
 
@@ -33,6 +41,39 @@ One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2,
 1. Upstream with matching `hostname`
 2. Upstream with matching `path_prefix`
 3. First upstream with neither (default catch-all)
+
+---
+
+## `[cache]` (v0.3+)
+
+Response cache (LRU + TTL). Only `GET 200` responses are cached, keyed by
+`host:path`; upstream `Cache-Control` is honored (`no-store` / `no-cache` /
+`private` bypass, `max-age=N` overrides the TTL). Cache misses are coalesced
+(single-flight), and hits carry an `X-Nyx-Cache: HIT` header. Note: the
+config only stores these values — the consumer must call
+`cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)` to activate
+the cache (both examples do).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | int | `0` | `1` enables the cache (via `cache_init`, see above) |
+| `max_entries` | int | `10000` | LRU capacity |
+| `default_ttl_seconds` | int | `300` | TTL when the upstream sends no `max-age` |
+
+---
+
+## `[metrics]` (v0.3+)
+
+Separate admin listener serving `GET /metrics` (Prometheus text format) and
+`GET /healthz`. It has **no authentication** — keep it on loopback and scrape
+locally or through an SSH tunnel. The consumer spawns it with
+`thread_spawn(admin_worker)`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | int | `0` | `1` enables the admin listener |
+| `bind` | string | `"127.0.0.1"` | Bind address. Do not use `0.0.0.0` without auth in front. |
+| `port` | int | `9090` | Admin port |
 
 ---
 
@@ -107,6 +148,10 @@ port = 3000
 
 ## Notes
 
-- `proxy.toml` is read once at startup. To reload config: `sudo systemctl restart nyx-proxy` (after `BGSAVE` on nyx-kv if needed).
-- If `proxy.toml` is not found, nyx-proxy starts with a single upstream at `127.0.0.1:3000` (hardcoded fallback).
-- Health check endpoint on upstreams: `GET /health` → 200. Upstreams without a `/health` route will be considered unhealthy. Add a simple health endpoint to your backends.
+- `proxy.toml` is read at startup. For hot reload of **routing** (upstreams /
+  vhosts / rate limit), spawn the library's `watch_config_loop(interval_sec)`
+  (`src/config.nx`) — it re-reads the file on mtime changes. TLS cert paths
+  are excluded by design: cert changes need a restart.
+- Health checks are **TCP-connect only** — a backend is healthy if its port
+  accepts connections. No HTTP endpoint is probed, so backends don't need a
+  `/health` route.

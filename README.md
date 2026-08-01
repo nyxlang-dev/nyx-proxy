@@ -45,7 +45,7 @@ main = "src/main.nx"
 nyx-proxy = "*"
 ```
 
-Wire config, router, and health checker:
+Wire the library modules (config parsing, health checker, dispatch):
 
 ```nyx
 import "nyx-proxy/src/config"
@@ -54,35 +54,43 @@ import "nyx-proxy/src/health"
 
 fn main() {
     load_config("proxy.toml")
-    health_start()
-    proxy_listen()
+    thread_spawn(health_checker)
+    // ... spawn workers that accept connections and call proxy_dispatch()
+    // Full working versions: examples/standalone.nx (HTTP) and
+    // examples/gateway-tls/ (HTTPS + SNI — see docs/TUTORIAL.md)
 }
 ```
 
-Minimal `proxy.toml`:
+Minimal `proxy.toml` (every key below exists in `src/config.nx` — the
+authoritative schema):
 
 ```toml
 [server]
-listen = 443
+listen = 8080
+workers = 64
+# Per-IP requests/second; 0 = disabled
+rate_limit = 100
+# TCP health checks (seconds / consecutive failures to mark unhealthy)
+health_check_interval = 10
+health_check_threshold = 3
+access_log = "/var/log/nyx-proxy/access.log"
+# TLS: set both to enable HTTPS. With TLS on, `listen` defaults to 443
+# unless set explicitly (v0.4.1+).
+# tls_cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# tls_key  = "/etc/letsencrypt/live/example.com/privkey.pem"
 
+# Virtual host: routed when the Host header matches `hostname`
 [upstream.0]
-name    = "app"
-host    = "127.0.0.1"
-port    = 3000
+name     = "app"
+host     = "127.0.0.1"
+port     = 3000
+hostname = "example.com"
 
-[vhost.0]
-domain  = "example.com"
-backend = "app"
-
-[health]
-interval_ms = 5000
-threshold   = 3
-
-[rate]
-requests_per_second = 100
-
-[logging]
-path = "/var/log/nyx-proxy/access.log"
+# No hostname and no path_prefix -> default catch-all upstream
+[upstream.1]
+name = "fallback"
+host = "127.0.0.1"
+port = 3000
 
 # Response cache LRU (v0.3+). Solo cachea GET 200 y honra Cache-Control
 # del upstream (no-store / no-cache / private bypassean, max-age=N override).
@@ -129,18 +137,20 @@ Metricas expuestas: `nyx_proxy_requests_total{host,status}`,
 `nyx_proxy_ratelimit_rejects_total{host}`,
 `nyx_proxy_uptime_seconds`.
 
-Expected output on startup:
-
-```
-[nyx-proxy] TLS ready — listening on :443
-[nyx-proxy] health checker started (5000ms interval)
-```
-
 Test the smoke test (HTTP mode):
 
 ```bash
 curl http://localhost:8080/
 ```
+
+## Tutorial
+
+**[docs/TUTORIAL.md](docs/TUTORIAL.md)** ([español](docs/TUTORIAL.es.md)) walks
+through building a real multi-domain HTTPS gateway on this library — TLS
+termination with SNI, HTTP→HTTPS redirect, WebSocket passthrough, rate
+limiting, cache and `/metrics` — with local self-signed certs and curl probes
+for every feature. The finished code is
+[`examples/gateway-tls/`](examples/gateway-tls/).
 
 ## Configuration
 
@@ -148,27 +158,23 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 
 | Section | Purpose |
 |---------|---------|
-| `[server]` | `listen`, `workers` |
-| `[upstream.N]` | `name`, `host`, `port` |
-| `[vhost.N]` | `domain`, `backend`, optional `path_prefix` |
-| `[health]` | `interval_ms`, `threshold` |
-| `[rate]` | `requests_per_second` per IP |
-| `[logging]` | `path` for access log |
+| `[server]` | `listen`, `workers`, `rate_limit`, `health_check_interval`, `health_check_threshold`, `access_log`, `tls_cert`, `tls_key` |
+| `[upstream.N]` | `name`, `host`, `port`, optional `hostname` (vhost) or `path_prefix` |
 | `[cache]` | `enabled`, `max_entries`, `default_ttl_seconds` (v0.3+) |
 | `[metrics]` | `enabled`, `bind`, `port` (v0.3+) |
 
 ## Documentation
 
+- [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — Build a multi-domain HTTPS gateway ([ES](docs/TUTORIAL.es.md))
 - [`docs/CONFIG.md`](docs/CONFIG.md) — Full `proxy.toml` reference
 
 ## Limitations
 
 - HTTP/1.1 to backends only — no HTTP/2 upstream
-- No WebSocket proxy support
+- WebSocket passthrough terminates TLS at the proxy; the upstream leg is plain TCP
 - Health checks are TCP-only (no HTTP endpoint probing)
-- TLS mode defaults to port 443 (configurable in `src/config.nx`)
-- Response cache ignores `Vary` header (v0.3 key is `host:path` only)
-- No single-flight / request coalescing on cache miss (thundering herd possible)
+- Response cache ignores `Vary` header (cache key is `host:path` only)
+- No hot reload of TLS certificates (config routing does hot-reload via `watch_config_loop`; cert changes need a restart)
 
 ## License
 
