@@ -1,0 +1,72 @@
+// test_proxy_config_listen.nx — Unit tests de la semántica de `server.listen`
+// bajo TLS. Hasta v0.4.0, `tls_cert` no vacío FORZABA g_listen_port = 443
+// incondicionalmente (config.nx): imposible correr un gateway TLS sin root
+// (el tutorial de examples/gateway-tls/ escucha en 8443). Contrato nuevo:
+// TLS sin `server.listen` explícito → 443 (default de producción, se
+// preserva); TLS con `server.listen` explícito → se respeta.
+//
+// Escribe los proxy.toml de prueba en /tmp (load_config solo lee strings:
+// los paths de cert no necesitan existir).
+//
+// Correr con NYX_PROJECT_DIR=<stack> (importa "src/config").
+
+import "src/config"
+
+fn test_tls_explicit_listen_respected() {
+    let path: String = "/tmp/nyx_proxy_test_listen_explicit.toml"
+    var cfg: String = "[server]\n"
+    cfg = cfg + "listen = 8443\n"
+    cfg = cfg + "tls_cert = \"/tmp/no-existe-cert.pem\"\n"
+    cfg = cfg + "tls_key = \"/tmp/no-existe-key.pem\"\n"
+    cfg = cfg + "\n[upstream.0]\n"
+    cfg = cfg + "name = \"app\"\n"
+    cfg = cfg + "host = \"127.0.0.1\"\n"
+    cfg = cfg + "port = 9101\n"
+    write_file(path, cfg)
+    load_config(path)
+    assert(g_tls_enabled == 1)
+    assert(g_listen_port == 8443)
+    print("PASS: TLS + listen explicito (8443) se respeta, no se pisa con 443")
+}
+
+fn test_tls_default_listen_forces_443() {
+    let path: String = "/tmp/nyx_proxy_test_listen_default.toml"
+    var cfg: String = "[server]\n"
+    cfg = cfg + "tls_cert = \"/tmp/no-existe-cert.pem\"\n"
+    cfg = cfg + "tls_key = \"/tmp/no-existe-key.pem\"\n"
+    cfg = cfg + "\n[upstream.0]\n"
+    cfg = cfg + "name = \"app\"\n"
+    cfg = cfg + "host = \"127.0.0.1\"\n"
+    cfg = cfg + "port = 9101\n"
+    write_file(path, cfg)
+    load_config(path)
+    assert(g_tls_enabled == 1)
+    assert(g_listen_port == 443)
+    print("PASS: TLS sin listen explicito fuerza 443 (default de produccion intacto)")
+}
+
+fn test_plain_http_listen_untouched() {
+    let path: String = "/tmp/nyx_proxy_test_listen_plain.toml"
+    var cfg: String = "[server]\n"
+    cfg = cfg + "listen = 9090\n"
+    cfg = cfg + "\n[upstream.0]\n"
+    cfg = cfg + "name = \"app\"\n"
+    cfg = cfg + "host = \"127.0.0.1\"\n"
+    cfg = cfg + "port = 9101\n"
+    write_file(path, cfg)
+    load_config(path)
+    assert(g_listen_port == 9090)
+    print("PASS: HTTP plano respeta listen = 9090 (sin regresion)")
+}
+
+fn main() -> int {
+    // Orden a propósito: el caso "default fuerza 443" corre DESPUÉS del
+    // explícito — load_config re-lee listen del toml en cada llamada, así
+    // que el 8443 del caso 1 no puede filtrarse al caso 2.
+    test_tls_explicit_listen_respected()
+    test_tls_default_listen_forces_443()
+    test_plain_http_listen_untouched()
+    print("")
+    print("ALL nyx-proxy config-listen tests passed")
+    return 0
+}

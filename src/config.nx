@@ -125,7 +125,13 @@ pub fn load_config(path: String) {
     g_tls_key = toml_get(parsed, "server.tls_key", "")
     if g_tls_cert.length() > 0 {
         g_tls_enabled = 1
-        g_listen_port = 443
+        // Default de producción: TLS implica :443 — pero SOLO si el config no
+        // trae un `server.listen` explícito. Un listen explícito gana, para
+        // poder correr un gateway TLS sin root (p.ej. examples/gateway-tls/
+        // escucha en 8443; hasta v0.4.0 este bloque lo pisaba incondicional).
+        if toml_has(parsed, "server.listen") == false {
+            g_listen_port = 443
+        }
     }
 
     // Cache (v0.3+): opt-in via [cache.enabled] = true.
