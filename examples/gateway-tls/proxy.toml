@@ -1,0 +1,48 @@
+# gateway-tls example config. Every key here exists in src/config.nx — the
+# authoritative schema (see docs/CONFIG.md).
+
+[server]
+# TLS is enabled by setting tls_cert/tls_key. With TLS on, `listen` defaults
+# to 443 — the explicit 8443 here lets the example run unprivileged (v0.4.1+).
+# For production: remove `listen` (or set 443) and point the certs at
+# /etc/letsencrypt/live/<domain>/.
+listen = 8443
+workers = 32
+tls_cert = "certs/example.com.pem"
+tls_key = "certs/example.com.key"
+# Requests per second per client IP; 0 = disabled. Set it to 5 to see the
+# 429 + Retry-After path with the curl loop from the tutorial.
+rate_limit = 0
+health_check_interval = 10
+health_check_threshold = 3
+
+# Virtual hosts: routed by SNI/Host header.
+[upstream.0]
+name = "web"
+host = "127.0.0.1"
+port = 9101
+hostname = "example.com"
+
+[upstream.1]
+name = "api"
+host = "127.0.0.1"
+port = 9102
+hostname = "api.example.com"
+
+# Catch-all for requests whose Host matches no vhost.
+[upstream.2]
+name = "fallback"
+host = "127.0.0.1"
+port = 9101
+
+[cache]
+enabled = 1
+max_entries = 10000
+default_ttl_seconds = 300
+
+[metrics]
+# Loopback on purpose: /metrics and /healthz have no auth. Scrape locally
+# or over an SSH tunnel; do NOT bind 0.0.0.0 without adding auth in front.
+enabled = 1
+bind = "127.0.0.1"
+port = 9090

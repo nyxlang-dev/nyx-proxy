@@ -1,0 +1,275 @@
+// gateway-tls — Real-world example: a multi-domain HTTPS gateway on nyx-proxy.
+//
+// This is the missing piece between examples/standalone.nx (plain HTTP) and a
+// production deployment: TLS termination with SNI (one gateway, N domains),
+// an HTTP→HTTPS redirect listener, WebSocket passthrough, rate limiting,
+// response cache and Prometheus /metrics — in one Nyx program.
+//
+// Follow docs/TUTORIAL.md for the full walkthrough (self-signed certs for
+// local testing, curl probes, systemd unit for production).
+//
+// Build (from this directory):
+//   nyx build     -> resolves nyx-proxy into packages/ and produces ./gateway-tls
+//   ./gateway-tls -> reads proxy.toml from the current directory
+//
+// The SNI cert registrations below are deployment-specific ON PURPOSE: a
+// gateway instance serves a concrete set of domains, so they are code, not
+// config. Swap the example.com entries for your own domains (in production,
+// point them at /etc/letsencrypt/live/<domain>/).
+
+import "std/http"
+import "std/proxy"
+import "nyx-proxy/src/config"
+import "nyx-proxy/src/router"
+import "nyx-proxy/src/health"
+import "nyx-proxy/src/logger"
+import "nyx-proxy/src/ratelimit"
+import "nyx-proxy/src/cache"
+import "nyx-proxy/src/metrics"
+import "nyx-proxy/src/admin"
+
+// Channel for dispatching accepted client fds to TLS workers
+var g_proxy_ch: Map = Map.new()
+
+// Channel for the HTTP→HTTPS redirect workers
+var g_redirect_ch: Map = Map.new()
+
+// Redirect listener port. 8080 so the example runs unprivileged; a
+// production deployment uses 80 (see the systemd notes in the tutorial).
+var g_redirect_port: int = 8080
+
+// HTTP redirect worker: read the request, answer 301 to the HTTPS origin.
+fn redirect_worker() -> int {
+    while 1 > 0 {
+        let client: int = channel_recv(g_redirect_ch)
+        if client < 0 { return 0 }
+
+        let request: Array = http_parse_request_fast(client)
+        let path: String = request[2]
+        let headers: Array = request[3]
+        let host_val: String = http_find_header(headers, "Host")
+
+        var location: String = "https://"
+        if host_val.length() > 0 {
+            let colon: int = host_val.indexOf(":")
+            if colon >= 0 {
+                location = location + host_val.substring(0, colon)
+            } else {
+                location = location + host_val
+            }
+        } else {
+            location = location + "example.com"
+        }
+        location = location + path
+
+        let crlf: String = "\r\n"
+        var resp: String = "HTTP/1.1 301 Moved Permanently" + crlf
+        resp = resp + "Location: " + location + crlf
+        resp = resp + "Content-Length: 0" + crlf
+        resp = resp + "Connection: close" + crlf
+        resp = resp + crlf
+
+        tcp_write(client, resp)
+        tcp_close(client)
+    }
+    return 0
+}
+
+fn start_redirect_listener() -> int {
+    let server: int = tcp_listen("0.0.0.0", g_redirect_port)
+    if server < 0 {
+        print("WARNING: cannot listen on port " + int_to_string(g_redirect_port) + " for HTTP redirect")
+        return 0
+    }
+    print("HTTP redirect: port " + int_to_string(g_redirect_port) + " -> HTTPS")
+
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            channel_send(g_redirect_ch, client)
+        }
+    }
+    return 0
+}
+
+// TLS worker: TLS handshake on the accepted fd, then a keep-alive
+// request/response loop. WebSocket upgrades hand the connection to the
+// library's ws_proxy tunnel.
+fn tls_worker() -> int {
+    while 1 > 0 {
+        let client_fd: int = channel_recv(g_proxy_ch)
+        if client_fd < 0 { return 0 }
+
+        let client_ip: String = getpeername(client_fd)
+        let ssl_handle: int = tls_accept(client_fd)
+        if ssl_handle == 0 {
+            tcp_close(client_fd)
+        } else {
+            var keep_alive: bool = true
+            while keep_alive {
+                let request_line: String = tls_read_line(ssl_handle)
+                if request_line.length() == 0 {
+                    keep_alive = false
+                } else {
+                    let parts: Array = request_line.split(" ")
+                    var method: String = "GET"
+                    var path: String = "/"
+                    if parts.length() >= 2 {
+                        method = parts[0]
+                        path = parts[1]
+                    }
+
+                    let headers: Array = []
+                    var done: int = 0
+                    while done == 0 {
+                        let hline: String = tls_read_line(ssl_handle)
+                        if hline.length() == 0 {
+                            done = 1
+                        } else {
+                            let colon_idx: int = hline.indexOf(": ")
+                            if colon_idx >= 0 {
+                                let key: String = hline.substring(0, colon_idx)
+                                let val: String = hline.substring(colon_idx + 2, hline.length())
+                                headers.push(key)
+                                headers.push(val)
+                            }
+                        }
+                    }
+
+                    var body: String = ""
+                    let cl_str: String = http_find_header(headers, "Content-Length")
+                    if cl_str.length() > 0 {
+                        let cl: int = string_to_int(cl_str)
+                        if cl > 0 {
+                            body = tls_read(ssl_handle, cl)
+                        }
+                    }
+
+                    let host_raw: String = http_find_header(headers, "Host")
+                    var host_name: String = host_raw
+                    let hcol: int = host_raw.indexOf(":")
+                    if hcol >= 0 {
+                        host_name = host_raw.substring(0, hcol)
+                    }
+
+                    // Rate limit BEFORE dispatching, so it also covers
+                    // WebSocket upgrades (each tunnel costs 2 threads).
+                    let rl_resp: String = proxy_check_rate(client_ip, host_name)
+                    if rl_resp.length() > 0 {
+                        tls_write_conn(ssl_handle, rl_resp)
+                        let rl_conn: String = http_find_header(headers, "Connection")
+                        if rl_conn == "close" {
+                            keep_alive = false
+                        }
+                    } else {
+                        // Real client IP toward the upstream: X-Forwarded-For
+                        // (appended) + X-Real-IP (replaced).
+                        let fwd_headers: Array = inject_forwarded_headers(headers, client_ip)
+                        let ws_upg: String = http_find_header(headers, "Upgrade")
+                        let ws_conn: String = http_find_header(headers, "Connection")
+                        if ws_upg.toLower() == "websocket" and ws_conn.toLower().indexOf("upgrade") >= 0 {
+                            ws_proxy(ssl_handle, method, path, fwd_headers, host_name)
+                            keep_alive = false
+                        } else {
+                            let request: Array = ["request", method, path, fwd_headers, body]
+                            let response: String = proxy_dispatch(request)
+                            if response.length() > 0 {
+                                tls_write_conn(ssl_handle, response)
+                            }
+                            let conn: String = http_find_header(headers, "Connection")
+                            if conn == "close" {
+                                keep_alive = false
+                            }
+                        }
+                    }
+                }
+            }
+            tls_close_conn(ssl_handle)
+        }
+    }
+    return 0
+}
+
+fn print_upstreams() {
+    var i: int = 0
+    while i < g_upstream_count {
+        let name: String = g_upstream_names[i]
+        let prefix: String = g_upstream_prefixes[i]
+        if prefix.length() > 0 {
+            print("  " + name + " [" + prefix + "]")
+        } else {
+            print("  " + name + " [default]")
+        }
+        i = i + 1
+    }
+}
+
+fn main() {
+    // Routing, TLS paths, cache, metrics and rate limit all come from
+    // proxy.toml in the current directory.
+    load_config("proxy.toml")
+
+    if g_tls_enabled == 0 {
+        print("gateway-tls: proxy.toml has no server.tls_cert — this example is")
+        print("the HTTPS one; for plain HTTP use examples/standalone.nx")
+        return 0
+    }
+
+    if g_cache_cfg_enabled == 1 {
+        cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)
+    }
+    if g_metrics_enabled == 1 {
+        metrics_init()
+    }
+
+    // Default certificate (also serves clients without SNI).
+    let tls_ok: int = tls_server_init(g_tls_cert, g_tls_key)
+    if tls_ok < 0 {
+        print("ERROR: TLS init failed — check cert/key paths in proxy.toml")
+        print("       (for local testing, generate them first: see certs/README.md)")
+        return 0
+    }
+
+    // SNI: one cert per additional domain this gateway serves.
+    // Deployment-specific by design — replace with your domains.
+    tls_server_add_cert("api.example.com", "certs/api.example.com.pem", "certs/api.example.com.key")
+
+    print("gateway-tls (HTTPS, SNI)")
+    print("Listening on port " + int_to_string(g_listen_port) + " with " + int_to_string(g_workers) + " workers")
+    print_upstreams()
+
+    g_proxy_ch = channel_new(512)
+    let server: int = tcp_listen("0.0.0.0", g_listen_port)
+    if server < 0 {
+        print("ERROR: cannot listen on port " + int_to_string(g_listen_port))
+        return 0
+    }
+
+    var i: int = 0
+    while i < g_workers {
+        thread_spawn(tls_worker)
+        i = i + 1
+    }
+
+    thread_spawn(health_checker)
+
+    if g_metrics_enabled == 1 {
+        thread_spawn(admin_worker)
+    }
+
+    g_redirect_ch = channel_new(128)
+    var r: int = 0
+    while r < 4 {
+        thread_spawn(redirect_worker)
+        r = r + 1
+    }
+    thread_spawn(start_redirect_listener)
+
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            channel_send(g_proxy_ch, client)
+        }
+    }
+    return 0
+}

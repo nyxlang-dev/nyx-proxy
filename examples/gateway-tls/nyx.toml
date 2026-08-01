@@ -1,0 +1,12 @@
+# gateway-tls example — a self-contained consumer project of nyx-proxy.
+# `nyx build` resolves the dependency by cloning the public repo into
+# packages/nyx-proxy (skipped if the directory already exists — inside a
+# clone of nyx-proxy you can just `cp -r ../../ packages/nyx-proxy` or let
+# the fetch happen; both work).
+[package]
+name = "gateway-tls"
+version = "0.1.0"
+main = "main.nx"
+
+[dependencies]
+nyx-proxy = "*"
