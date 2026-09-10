@@ -43,7 +43,11 @@ fn _lat_bucket_le(idx: int) -> int {
 // ratelimit_rejects_total: key = host
 var g_m_ratelimit: Map = Map.new()
 
-// Epoch de arranque en ms — para emitir uptime_seconds.
+// Instante de arranque en ms del reloj MONÓTONO — para emitir uptime_seconds.
+//
+// No es epoch: el uptime es una DURACIÓN, y medir duraciones contra
+// `time_epoch()` las deja a merced de un salto de NTP o de un cambio manual de
+// hora. `time_ms()` es `os_monotonic_ns() / 1000000`, inmune a los dos.
 var g_m_start_ms: Array = []
 
 var g_metrics_mtx: Map = Map.new()
@@ -52,7 +56,12 @@ var g_metrics_init_done: int = 0
 pub fn metrics_init() {
     if g_metrics_init_done == 1 { return 0 }
     g_metrics_mtx = mutex_new()
-    g_m_start_ms.push(time_epoch() / 1000)
+    // Antes: `time_epoch() / 1000`. `time_epoch()` devuelve SEGUNDOS, así que
+    // la división daba kilosegundos guardados en una variable llamada `_ms`, y
+    // el cálculo de abajo volvía a dividir entre 1000: el gauge
+    // `nyx_proxy_uptime_seconds` reportaba 0 hasta que el proxy llevaba
+    // 11,6 días arriba. Arreglado el 2026-09-10.
+    g_m_start_ms.push(time_ms())
     g_metrics_init_done = 1
     return 0
 }
@@ -180,7 +189,7 @@ pub fn metrics_render() -> String {
     let sf_waits: int = sf_stats[0]
     let sf_timeouts: int = sf_stats[1]
 
-    let now_ms: int = time_epoch() / 1000
+    let now_ms: int = time_ms()
     let uptime_s: int = (now_ms - start_ms) / 1000
 
     var sb: StringBuilder = StringBuilder.new()

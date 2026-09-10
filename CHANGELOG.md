@@ -5,8 +5,9 @@ Se lleva el historial de releases separado del lenguaje. Ver
 
 ## v0.4.2 — 2026-09-10
 
-**Dos usos de `time_epoch()` divididos entre 1.000.000: el rate limiter tenía la
-ventana congelada y el access log escribía `1789` como marca de tiempo.**
+**Tres relojes mal escalados: la ventana del rate limiter estaba congelada, el
+access log escribía `1789` como marca de tiempo y el uptime de `/metrics`
+reportaba 0.**
 
 - `src/ratelimit.nx` — **fix (silently-wrong)**: `proxy_check_rate` calculaba
   `now = time_epoch() / 1000000` con el comentario «// seconds» al lado.
@@ -18,7 +19,13 @@ ventana congelada y el access log escribía `1789` como marca de tiempo.**
 - `src/logger.nx` — **fix**: el mismo `/ 1000000` en `access_log` escribía `1789`
   al frente de cada línea en vez de `1789048733`. Un access log sin marca de
   tiempo utilizable.
-- Suite nueva `tests/test_proxy_time.nx` (4 casos, **RED verificado**: con la
+- `src/metrics.nx` — **fix**: el mismo error de escala en un tercer sitio.
+  `metrics_init` guardaba `time_epoch() / 1000` (kilosegundos) en una variable
+  llamada `g_m_start_ms`, y `metrics_render` volvía a dividir entre 1000 para
+  sacar los segundos: el gauge `nyx_proxy_uptime_seconds` reportaba **0** hasta
+  que el proxy llevaba 11,6 días arriba. Ahora usa `time_ms()`, que es el reloj
+  MONÓTONO — el correcto para una duración, inmune a un salto de NTP.
+- Suite nueva `tests/test_proxy_time.nx` (5 casos, **RED verificado**: con la
   división reintroducida falla en el caso de la ventana). Ninguna de las cinco
   suites que había tocaba `ratelimit.nx` ni `logger.nx` — por eso el bug
   sobrevivió desde que se escribieron los módulos.

@@ -22,6 +22,23 @@ import "src/logger"
 import "src/ratelimit"
 import "src/metrics"
 
+// Extrae el valor de una metrica Prometheus sin labels: "nombre 42\n" -> 42.
+// La marca lleva el "\n" adelante a proposito: sin el, indexOf pega primero en
+// la linea "# HELP <nombre> Seconds since..." y se intenta parsear la glosa.
+fn valor_metrica(salida: String, nombre: String) -> int {
+    let marca: String = "\n" + nombre + " "
+    let pos: int = salida.indexOf(marca)
+    if pos < 0 { return -1 }
+    let desde: int = pos + marca.length()
+    var fin: int = desde
+    while fin < salida.length() {
+        let c: String = salida.substring(fin, fin + 1)
+        if c == "\n" { break }
+        fin = fin + 1
+    }
+    return string_to_int(salida.substring(desde, fin))
+}
+
 fn primer_campo(linea: String) -> String {
     let esp: int = linea.indexOf(" ")
     if esp < 0 { return linea }
@@ -29,6 +46,10 @@ fn primer_campo(linea: String) -> String {
 }
 
 fn main() -> int {
+    // Se inicializa acá para que el sleep de 1,1 s del rate limiter valga
+    // también como uptime medible más abajo, sin dormir dos veces.
+    metrics_init()
+
     // ── Rate limiter ──────────────────────────────────────────────────────
     g_rate_limit = 2
 
@@ -61,6 +82,16 @@ fn main() -> int {
     let despues: String = proxy_check_rate(ip_bloqueada, "test")
     assert(despues.length() == 0)
     print("PASS ratelimit: la ventana avanza con el reloj (un segundo la resetea)")
+
+    // ── /metrics: uptime ──────────────────────────────────────────────────
+    // Tercer sitio del mismo error: `metrics_init` guardaba
+    // `time_epoch() / 1000` en una variable llamada `_ms` y el render volvía a
+    // dividir entre 1000, así que `nyx_proxy_uptime_seconds` marcaba 0 hasta
+    // que el proxy llevaba 11,6 días arriba. Con el sleep de arriba ya pasó
+    // más de un segundo desde `metrics_init()`.
+    let uptime: int = valor_metrica(metrics_render(), "nyx_proxy_uptime_seconds")
+    assert(uptime >= 1)
+    print("PASS metrics: nyx_proxy_uptime_seconds avanza (" + int_to_string(uptime) + "s)")
 
     // ── Access log ────────────────────────────────────────────────────────
     let ruta: String = "/tmp/nyx_proxy_test_access.log"
