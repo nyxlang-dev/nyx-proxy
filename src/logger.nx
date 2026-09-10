@@ -23,7 +23,12 @@ pub fn access_log(method: String, path: String, status: int, latency_us: int) {
     if g_log_enabled == 0 { return 0 }
 
     let latency_ms: int = latency_us / 1000
-    let ts: int = time_epoch() / 1000000
+    // `time_epoch()` YA devuelve segundos (`time(NULL)`). El `/ 1000000` que
+    // había acá venía con el comentario «// seconds» y hacía lo contrario:
+    // escribía 1789 en vez de 1789048733 — un número sin significado en cada
+    // línea del log. Encontrado el 2026-09-10 al inventariar los usos de la
+    // familia de tiempo del core.
+    let ts: int = time_epoch()
 
     var sb: StringBuilder = StringBuilder.new()
     sb.append(int_to_string(ts))

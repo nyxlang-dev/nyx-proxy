@@ -3,6 +3,28 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.2 — 2026-09-10
+
+**Dos usos de `time_epoch()` divididos entre 1.000.000: el rate limiter tenía la
+ventana congelada y el access log escribía `1789` como marca de tiempo.**
+
+- `src/ratelimit.nx` — **fix (silently-wrong)**: `proxy_check_rate` calculaba
+  `now = time_epoch() / 1000000` con el comentario «// seconds» al lado.
+  `time_epoch()` YA devuelve segundos, así que `now` avanzaba una vez cada
+  1.000.000 de segundos — **11,6 días**. La ventana de un segundo del token
+  bucket quedaba congelada: todas las peticiones de casi dos semanas caían en el
+  mismo cubo, y una IP que llegaba al límite seguía recibiendo 429 hasta el
+  siguiente múltiplo de 1.000.000. Sin error, sin log, sin crash.
+- `src/logger.nx` — **fix**: el mismo `/ 1000000` en `access_log` escribía `1789`
+  al frente de cada línea en vez de `1789048733`. Un access log sin marca de
+  tiempo utilizable.
+- Suite nueva `tests/test_proxy_time.nx` (4 casos, **RED verificado**: con la
+  división reintroducida falla en el caso de la ventana). Ninguna de las cinco
+  suites que había tocaba `ratelimit.nx` ni `logger.nx` — por eso el bug
+  sobrevivió desde que se escribieron los módulos.
+- `CAPABILITIES.md` regenerado por el toolchain (la stdlib del core creció:
+  `std/time`, `std/postgres`).
+
 ## v0.4.1 — 2026-08-01
 
 **El camino HTTPS existe fuera de producción: tutorial + ejemplo real

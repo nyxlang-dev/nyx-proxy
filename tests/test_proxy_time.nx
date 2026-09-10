@@ -1,0 +1,88 @@
+// test_proxy_time.nx — Regresión del 2026-09-10: el proxy dividía `time_epoch()`
+// entre 1.000.000 en DOS sitios, con el comentario «// seconds» al lado.
+// `time_epoch()` ya devuelve segundos, así que la división convertía el reloj en
+// un contador que avanza una vez cada 11,6 días.
+//
+//   · src/ratelimit.nx — la ventana del rate limiter quedaba congelada: todas
+//     las peticiones de casi dos semanas caían en el mismo cubo, así que una IP
+//     que llegaba al límite quedaba bloqueada hasta el siguiente múltiplo de
+//     1.000.000 de segundos.
+//   · src/logger.nx — cada línea del access log escribía «1789» en vez de la
+//     marca de tiempo.
+//
+// Ninguna de las dos suites que había cubría estos módulos; por eso el bug
+// sobrevivió. Este test cierra los dos.
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/metrics"
+
+fn primer_campo(linea: String) -> String {
+    let esp: int = linea.indexOf(" ")
+    if esp < 0 { return linea }
+    return linea.substring(0, esp)
+}
+
+fn main() -> int {
+    // ── Rate limiter ──────────────────────────────────────────────────────
+    g_rate_limit = 2
+
+    // Ráfaga dentro de una misma ventana de un segundo: la tercera petición
+    // debe dar 429. Se reintenta porque la ráfaga puede caer justo sobre el
+    // borde del segundo y resetear el cubo a mitad de camino; con la ráfaga
+    // durando microsegundos, fallar cinco veces seguidas no pasa.
+    var rechazo: String = ""
+    var intento: int = 0
+    while intento < 5 && rechazo.length() == 0 {
+        let ip: String = "198.51.100." + int_to_string(intento)
+        let a: String = proxy_check_rate(ip, "test")
+        let b: String = proxy_check_rate(ip, "test")
+        let c: String = proxy_check_rate(ip, "test")
+        if a.length() == 0 && b.length() == 0 && c.length() > 0 {
+            rechazo = c
+        }
+        intento = intento + 1
+    }
+    assert(rechazo.length() > 0)
+    assert(rechazo.indexOf("429 Too Many Requests") >= 0)
+    print("PASS ratelimit: la petición que pasa el límite recibe 429")
+
+    // EL caso de regresión: pasado un segundo, la ventana avanza y la misma IP
+    // vuelve a pasar. Con `time_epoch() / 1000000` el valor de `now` era el
+    // mismo un segundo después —y once días después—, así que esta llamada
+    // seguía devolviendo 429.
+    let ip_bloqueada: String = "198.51.100." + int_to_string(intento - 1)
+    sleep(1100)
+    let despues: String = proxy_check_rate(ip_bloqueada, "test")
+    assert(despues.length() == 0)
+    print("PASS ratelimit: la ventana avanza con el reloj (un segundo la resetea)")
+
+    // ── Access log ────────────────────────────────────────────────────────
+    let ruta: String = "/tmp/nyx_proxy_test_access.log"
+    if file_exists(ruta) { remove_file(ruta) }
+    g_access_log_path = ruta
+    access_log("GET", "/salud", 200, 4321)
+
+    assert(file_exists(ruta))
+    let contenido: String = read_file(ruta)
+    let ts_txt: String = primer_campo(contenido)
+    let ts: int = string_to_int(ts_txt)
+
+    // Cota inferior fija: 2023-11-14. Cualquier epoch real la supera; el 1789
+    // que escribía el bug, no. Se evita comparar contra `time_epoch()` en vivo
+    // para que el test no se apoye en la función que está bajo prueba.
+    assert(ts > 1700000000)
+    print("PASS logger: el access log escribe un epoch real (" + ts_txt + "), no 1789")
+
+    assert(contenido.indexOf("GET /salud 200 4ms") >= 0)
+    print("PASS logger: método, ruta, estado y latencia en milisegundos")
+
+    remove_file(ruta)
+    print("test_proxy_time: OK")
+    return 0
+}

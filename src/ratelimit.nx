@@ -23,7 +23,12 @@ pub fn proxy_check_rate(ip: String, host: String) -> String {
     if g_rate_limit == 0 { return "" }
     rl_init()
 
-    let now: int = time_epoch() / 1000000  // seconds
+    // `time_epoch()` YA devuelve segundos. El `/ 1000000` que había acá,
+    // comentado «// seconds», hacía que `now` avanzara UNA VEZ cada 1.000.000
+    // de segundos —11,6 días—, así que la ventana del rate limiter estaba
+    // prácticamente congelada: todas las peticiones de casi dos semanas caían
+    // en el mismo cubo. Es el peor de los dos sitios.
+    let now: int = time_epoch()
 
     mutex_lock(g_rl_mtx)
 
