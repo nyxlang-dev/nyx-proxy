@@ -10,7 +10,7 @@ set -uo pipefail
 STACK="$(cd "$(dirname "$0")/.." && pwd)"
 NYX_HOME="${NYX_HOME:-/home/admin/nyx/lang}"
 cd "$STACK"
-TESTS="test_proxy_cache test_proxy_metrics test_proxy_xff test_proxy_retry test_proxy_config_listen test_proxy_time"
+TESTS="test_proxy_cache test_proxy_metrics test_proxy_xff test_proxy_retry test_proxy_config_listen test_proxy_time test_proxy_pool_framing"
 pass=0; fail=0
 for name in $TESTS; do
     src="tests/${name}.nx"

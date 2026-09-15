@@ -3,6 +3,46 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.3 — 2026-09-15
+
+**SEGURIDAD: el pool de conexiones al upstream podía entregarle a un pedido los
+bytes de la respuesta de OTRO.**
+
+- `src/router.nx` — **fix (seguridad, mezcla de respuestas entre usuarios)**:
+  `read_upstream_response` leía el cuerpo SOLO si venía `Content-Length`,
+  comparado con mayúsculas exactas, y devolvía el fd al pool igual. Con una
+  respuesta `Transfer-Encoding: chunked`, delimitada por cierre, o con
+  `content-length` en minúscula, el cuerpo quedaba sin leer en el socket y el
+  SIGUIENTE pedido que tomaba ese fd —quizá de otro usuario— lo leía como su
+  respuesta. Medido antes del fix: con un upstream chunked sobre keep-alive, la
+  respuesta al segundo pedido empezaba con `5` (el tamaño de chunk del primero);
+  con `content-length` en minúscula, empezaba con `uno!!HTTP/1.1 200 OK`.
+  Hoy no se disparaba en producción porque todos los upstreams mandan
+  `Content-Length` capitalizado, pero cualquier upstream con streaming, chunked o
+  SSE lo disparaba. Ahora el encuadre sigue RFC 9112 §6.3: cabeceras sin
+  mayúsculas; HEAD, 1xx, 204 y 304 sin cuerpo (los 1xx provisionales se saltan);
+  chunked se lee hasta el chunk 0 y trailers, y se reemite con `Content-Length`;
+  `Transfer-Encoding` y `Content-Length` a la vez → gana chunked y el fd no se
+  reusa; EOF entre el chunk 0 y la línea final → se entrega el cuerpo pero el fd
+  no se reusa; `Content-Length` truncado → 502; sin longitud → se lee hasta el
+  cierre con plazo de inactividad (30 s sin recibir un byte) y tope (16 MiB), y el
+  fd se descarta siempre. `Connection: close` en cualquier capitalización, y
+  HTTP/1.0 sin keep-alive, descartan el fd.
+- Suite nueva `tests/test_proxy_pool_framing.nx` (11 casos, con upstreams locales
+  que atienden varios pedidos sobre UNA conexión, así que si el proxy abriera otra
+  el test cuelga y falla): chunked, minúsculas, delimitado por cierre, sin cierre
+  que vence el plazo, HEAD, 304/204/100, Content-Length truncado, `connection:
+  Close`, TE+CL, EOF en los trailers de chunked y el control positivo de que
+  Content-Length normal se sigue reusando. RED verificado contra el router previo:
+  fallan o cuelgan los 10 casos del bug y pasa solo el control positivo.
+- Fuera de alcance, pendiente: una respuesta SSE (`text/event-stream`) detrás del
+  proxy ya no corrompe el pool, pero tampoco se transmite en vivo: se junta hasta
+  el cierre y vence a los 30 s de silencio. El túnel en un solo sentido es la
+  Task 6 del arco serve-sse del lenguaje.
+- Fuera de alcance, sin cambio: `ws_proxy` ante un handshake rechazado sigue
+  relayando solo los headers (no pasa por el pool); una respuesta con
+  `Content-Length` enorme se sigue leyendo sin tope, como antes.
+
 ## v0.4.2 — 2026-09-10
 
 **Tres relojes mal escalados: la ventana del rate limiter estaba congelada, el

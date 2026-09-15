@@ -1,0 +1,391 @@
+// test_proxy_pool_framing.nx — el pool de conexiones al upstream NUNCA reutiliza
+// un fd con bytes de la respuesta anterior sin leer.
+//
+// Bug que fija (2026-09-14, seguridad): read_upstream_response leía el cuerpo
+// SOLO si venía `Content-Length` (comparado con mayúsculas exactas) y devolvía
+// el fd al pool igual. Con una respuesta chunked, delimitada por cierre, o con
+// `content-length` en minúscula, el cuerpo quedaba en el socket y el SIGUIENTE
+// pedido que tomaba ese fd —quizá de otro usuario— lo leía como su respuesta.
+//
+// Cada caso levanta un upstream falso en un puerto local fijo FUERA del rango
+// efímero (19350-19360) que atiende VARIOS pedidos sobre UNA sola conexión: si el
+// proxy abriera otra conexión en vez de reusar el pool, el upstream no la acepta
+// y el runner corta por timeout — el test falla, no pasa por casualidad.
+//
+// Correr con NYX_PROJECT_DIR=<stack> (router.nx importa "src/...").
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+var g_srvs: Array = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+// Lee un pedido sin cuerpo (request line + headers hasta la línea vacía).
+fn drain_request(c: int) {
+    var fin: int = 0
+    var n: int = 0
+    while fin == 0 {
+        let line: String = tcp_read_line(c)
+        n = n + 1
+        if line.length() == 0 {
+            if n > 1 {
+                fin = 1
+            } else {
+                // EOF antes de leer nada: el cliente se fue.
+                fin = 1
+            }
+        }
+    }
+}
+
+fn get_headers() -> Array {
+    let h: Array = ["Host", "test"]
+    return h
+}
+
+// ── Caso 1: chunked sobre keep-alive, y el fd se reusa ────────────────────────
+
+fn up_chunked() -> int {
+    let srv: int = g_srvs[0]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhola-\r\n7;ext=1\r\nprimero\r\n0\r\nX-Trailer: t\r\n\r\n")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsegundo")
+    tcp_close(c)
+    return 0
+}
+
+fn test_chunked_keepalive() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19350)
+    g_srvs[0] = srv
+    let tid: int = thread_spawn(up_chunked)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19350 }
+    let r1: String = forward_pooled(3, "GET", "/a", get_headers(), "", b)
+    let r2: String = forward_pooled(3, "GET", "/b", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r2.indexOf("hola") < 0, "el segundo pedido NO recibe bytes del primero")
+    assert(r2.startsWith("HTTP/1.1 200"), "el segundo pedido empieza con su status-line")
+    assert(r2.endsWith("segundo"), "el segundo pedido recibe su cuerpo")
+    assert(r1.endsWith("\r\n\r\nhola-primero"), "el cuerpo chunked llega desagrupado")
+    assert(r1.indexOf("Content-Length: 12") >= 0, "se reemite con Content-Length")
+    assert(r1.toLower().indexOf("transfer-encoding") < 0, "no se reenvía Transfer-Encoding")
+    print("PASS: chunked sobre keep-alive se lee entero y el fd se reusa limpio")
+}
+
+// ── Caso 2: `content-length` en minúscula ─────────────────────────────────────
+
+fn up_lower() -> int {
+    let srv: int = g_srvs[1]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\ncontent-length:5\r\n\r\nuno!!")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ndos")
+    tcp_close(c)
+    return 0
+}
+
+fn test_content_length_minuscula() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19351)
+    g_srvs[1] = srv
+    let tid: int = thread_spawn(up_lower)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19351 }
+    let r1: String = forward_pooled(4, "GET", "/a", get_headers(), "", b)
+    let r2: String = forward_pooled(4, "GET", "/b", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r2.indexOf("uno") < 0, "el segundo pedido NO recibe bytes del primero")
+    assert(r2.startsWith("HTTP/1.1 200"), "status-line limpia en el segundo")
+    assert(r2.endsWith("dos"), "cuerpo del segundo")
+    assert(r1.endsWith("uno!!"), "cuerpo con content-length en minúscula y sin espacio")
+    print("PASS: content-length en minúscula se respeta y el fd se reusa limpio")
+}
+
+// ── Caso 3: cuerpo delimitado por cierre, el fd no vuelve al pool ─────────────
+
+fn up_close_delimited() -> int {
+    let srv: int = g_srvs[2]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ncuerpo-sin-largo")
+    tcp_close(c)
+    return 0
+}
+
+fn test_delimitado_por_cierre() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19352)
+    g_srvs[2] = srv
+    let tid: int = thread_spawn(up_close_delimited)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19352 }
+    let r1: String = forward_pooled(5, "GET", "/a", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.endsWith("\r\n\r\ncuerpo-sin-largo"), "el cuerpo se lee hasta el cierre")
+    assert(r1.indexOf("Content-Length: 16") >= 0, "se reemite con Content-Length")
+    assert(pool_len(5) == 0, "un fd sin longitud delimitada no vuelve al pool")
+    print("PASS: cuerpo delimitado por cierre se lee entero y el fd se descarta")
+}
+
+// ── Caso 4: sin longitud y el upstream no cierra: plazo, 502, descarte ────────
+
+fn up_never_closes() -> int {
+    let srv: int = g_srvs[3]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\n\r\nparcial")
+    sleep(2500)
+    tcp_close(c)
+    return 0
+}
+
+fn test_sin_largo_sin_cierre_vence() {
+    pool_init()
+    upstream_set_close_timeout(1)
+    let srv: int = tcp_listen("127.0.0.1", 19353)
+    g_srvs[3] = srv
+    let tid: int = thread_spawn(up_never_closes)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19353 }
+    let r1: String = forward_pooled(6, "GET", "/a", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    upstream_set_close_timeout(30)
+    assert(r1.indexOf("502") >= 0, "una respuesta sin longitud que no termina es 502")
+    assert(r1.indexOf("parcial") < 0, "no se entrega un cuerpo truncado como si fuera completo")
+    assert(pool_len(6) == 0, "el fd se descarta")
+    print("PASS: sin longitud y sin cierre vence el plazo: 502 y fd descartado")
+}
+
+// ── Caso 5: HEAD con Content-Length no tiene cuerpo, y el fd se reusa ─────────
+
+fn up_head() -> int {
+    let srv: int = g_srvs[4]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    tcp_close(c)
+    return 0
+}
+
+fn test_head_sin_cuerpo() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19354)
+    g_srvs[4] = srv
+    let tid: int = thread_spawn(up_head)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19354 }
+    let r1: String = forward_pooled(7, "HEAD", "/a", get_headers(), "", b)
+    let r2: String = forward_pooled(7, "GET", "/b", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.indexOf("Content-Length: 11") >= 0, "HEAD conserva el Content-Length del upstream")
+    assert(r1.endsWith("\r\n\r\n"), "HEAD no lleva cuerpo")
+    assert(r2.endsWith("\r\n\r\nok"), "el pedido siguiente sobre el mismo fd funciona")
+    print("PASS: HEAD con Content-Length no espera cuerpo y el fd se reusa")
+}
+
+// ── Caso 6: 304 y 204 no tienen cuerpo; 100 Continue es provisional ───────────
+
+fn up_sin_cuerpo() -> int {
+    let srv: int = g_srvs[5]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 204 No Content\r\n\r\n")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nfin")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\notra")
+    tcp_close(c)
+    return 0
+}
+
+fn test_304_204_100() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19355)
+    g_srvs[5] = srv
+    let tid: int = thread_spawn(up_sin_cuerpo)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19355 }
+    let r1: String = forward_pooled(8, "GET", "/a", get_headers(), "", b)
+    let r2: String = forward_pooled(8, "GET", "/b", get_headers(), "", b)
+    let r3: String = forward_pooled(8, "GET", "/c", get_headers(), "", b)
+    let r4: String = forward_pooled(8, "GET", "/d", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.startsWith("HTTP/1.1 304"), "304")
+    assert(r1.endsWith("\r\n\r\n"), "304 sin cuerpo")
+    assert(r2.startsWith("HTTP/1.1 204"), "204")
+    assert(r3.startsWith("HTTP/1.1 200"), "el 100 Continue provisional se salta")
+    assert(r3.endsWith("fin"), "cuerpo de la respuesta final tras el 100")
+    assert(r4.endsWith("otra"), "el fd sigue limpio después")
+    print("PASS: 304/204 sin cuerpo y 100 Continue provisional, fd reusado limpio")
+}
+
+// ── Caso 7 (control positivo): Content-Length normal se sigue pooleando ───────
+
+fn up_normal() -> int {
+    let srv: int = g_srvs[6]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nuno!")
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndos!")
+    drain_request(c)
+    tcp_close(c)
+    return 0
+}
+
+fn test_control_positivo_pool() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19356)
+    g_srvs[6] = srv
+    let tid: int = thread_spawn(up_normal)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19356 }
+    let r1: String = forward_pooled(9, "GET", "/a", get_headers(), "", b)
+    let n1: int = pool_len(9)
+    let r2: String = forward_pooled(9, "GET", "/b", get_headers(), "", b)
+    let n2: int = pool_len(9)
+    // Cierra el fd pooleado para que el upstream salga de su último drain.
+    let fd: int = pool_get(9, "127.0.0.1", 19356)
+    tcp_close(fd)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.endsWith("uno!"), "primer cuerpo")
+    assert(r2.endsWith("dos!"), "segundo cuerpo")
+    assert(n1 == 1, "tras una respuesta con Content-Length el fd vuelve al pool")
+    assert(n2 == 1, "y se reusa (sigue habiendo uno solo)")
+    print("PASS: Content-Length normal se sigue reusando (control positivo)")
+}
+
+// ── Caso 8: Content-Length mayor que lo recibido: 502, fd descartado ──────────
+
+fn up_truncado() -> int {
+    let srv: int = g_srvs[7]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+    tcp_close(c)
+    return 0
+}
+
+fn test_content_length_truncado() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19357)
+    g_srvs[7] = srv
+    let tid: int = thread_spawn(up_truncado)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19357 }
+    let r1: String = forward_pooled(10, "POST", "/a", get_headers(), "x", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.indexOf("502") >= 0, "cuerpo más corto que Content-Length es 502")
+    assert(r1.indexOf("abc") < 0, "no se entrega el cuerpo truncado")
+    assert(pool_len(10) == 0, "el fd se descarta")
+    print("PASS: Content-Length truncado da 502 y descarta el fd")
+}
+
+// ── Caso 9: `connection: Close` (cualquier capitalización) descarta ──────────
+
+fn up_conn_close() -> int {
+    let srv: int = g_srvs[8]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nconnection: Close\r\nContent-Length: 2\r\n\r\nok")
+    tcp_close(c)
+    return 0
+}
+
+fn test_connection_close_minuscula() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19358)
+    g_srvs[8] = srv
+    let tid: int = thread_spawn(up_conn_close)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19358 }
+    let r1: String = forward_pooled(11, "GET", "/a", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.endsWith("ok"), "cuerpo")
+    assert(pool_len(11) == 0, "connection: Close en cualquier capitalización descarta el fd")
+    print("PASS: connection: Close en minúscula descarta el fd")
+}
+
+// ── Caso 10: Transfer-Encoding + Content-Length: gana chunked y no se reusa ──
+
+fn up_te_y_cl() -> int {
+    let srv: int = g_srvs[9]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n")
+    sleep(300)
+    tcp_close(c)
+    return 0
+}
+
+fn test_te_y_cl() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19359)
+    g_srvs[9] = srv
+    let tid: int = thread_spawn(up_te_y_cl)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19359 }
+    let r1: String = forward_pooled(12, "GET", "/a", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.endsWith("\r\n\r\nabc"), "con TE y CL a la vez manda chunked")
+    assert(r1.indexOf("Content-Length: 3") >= 0, "se reemite la longitud real")
+    assert(r1.indexOf("Content-Length: 99") < 0, "no se reenvía el Content-Length del upstream")
+    assert(pool_len(12) == 0, "TE+CL (señal de smuggling) no se reusa")
+    print("PASS: Transfer-Encoding + Content-Length: gana chunked y el fd se descarta")
+}
+
+// ── Caso 11: EOF entre el chunk 0 y la línea vacía final ──────────────────────
+// El cuerpo ya llegó entero, pero el upstream cerró: ese fd en el pool haría
+// fallar al pedido siguiente (y un POST no se reintenta).
+
+fn up_trailer_eof() -> int {
+    let srv: int = g_srvs[10]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntodo\r\n0\r\n")
+    tcp_close(c)
+    return 0
+}
+
+fn test_chunked_eof_en_trailers() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19360)
+    g_srvs[10] = srv
+    let tid: int = thread_spawn(up_trailer_eof)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19360 }
+    let r1: String = forward_pooled(13, "GET", "/a", get_headers(), "", b)
+    thread_join(tid)
+    tcp_close(srv)
+    assert(r1.endsWith("\r\n\r\ntodo"), "el cuerpo completo se entrega")
+    assert(pool_len(13) == 0, "un fd que cerró en los trailers no vuelve al pool")
+    print("PASS: EOF en los trailers de chunked entrega el cuerpo y descarta el fd")
+}
+
+fn main() -> int {
+    test_chunked_keepalive()
+    test_content_length_minuscula()
+    test_delimitado_por_cierre()
+    test_sin_largo_sin_cierre_vence()
+    test_head_sin_cuerpo()
+    test_304_204_100()
+    test_control_positivo_pool()
+    test_content_length_truncado()
+    test_connection_close_minuscula()
+    test_te_y_cl()
+    test_chunked_eof_en_trailers()
+    print("")
+    print("ALL nyx-proxy pool framing tests passed")
+    return 0
+}

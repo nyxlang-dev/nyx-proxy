@@ -4,6 +4,7 @@
 
 import "std/http"
 import "std/proxy"
+import "std/net"
 import "src/cache"
 import "src/metrics"
 
@@ -56,6 +57,30 @@ fn pool_put(idx: int, fd: int) {
 // Discard a broken fd (don't return to pool)
 fn pool_discard(fd: int) {
     tcp_close(fd)
+}
+
+// fds ociosos en el pool de un upstream (tests y diagnóstico).
+fn pool_len(idx: int) -> int {
+    mutex_lock(g_pool_mtx)
+    let pool: Array = g_pools[idx]
+    let n: int = pool.length()
+    mutex_unlock(g_pool_mtx)
+    return n
+}
+
+// Tope (bytes) para respuestas cuya longitud NO viene declarada —chunked o
+// delimitadas por cierre—: el proxy las junta enteras para reemitirlas con
+// Content-Length, así que un upstream roto o malicioso no puede hacerlas crecer
+// sin límite. Con Content-Length rige lo declarado (comportamiento previo).
+var g_upstream_max_body: int = 16777216
+
+// Plazo de inactividad (s) para un cuerpo delimitado por cierre: sin longitud, el
+// único fin posible es que el upstream cierre. Si se queda callado ese tiempo (un
+// stream, un SSE, un bug) se corta con 502 en vez de colgar el worker para siempre.
+var g_upstream_close_timeout_s: int = 30
+
+fn upstream_set_close_timeout(seconds: int) {
+    g_upstream_close_timeout_s = seconds
 }
 
 // Inyecta X-Forwarded-For / X-Real-IP en un array de headers parseados
@@ -145,11 +170,11 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
             return http_response(502, "Bad Gateway: cannot connect to upstream")
         }
         tcp_write(fd2, req)
-        let res2: Array = read_upstream_response(idx, fd2)
+        let res2: Array = read_upstream_response_m(idx, method, fd2)
         return res2[0]
     }
 
-    let res: Array = read_upstream_response(idx, fd)
+    let res: Array = read_upstream_response_m(idx, method, fd)
     let resp: String = res[0]
     let was_stale: int = res[1]
     if was_stale == 1 {
@@ -172,7 +197,7 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
                 pool_discard(fd3)
                 return resp
             }
-            let res3: Array = read_upstream_response(idx, fd3)
+            let res3: Array = read_upstream_response_m(idx, method, fd3)
             return res3[0]
         }
         return resp
@@ -184,53 +209,336 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
 // cuando la status-line vino vacia (NI UN byte leido: conexion pooled
 // muerta, tipico post-restart del upstream) para que forward_pooled pueda
 // distinguirlo de un 502 real que el backend efectivamente respondio.
+//
+// ENCUADRE DEL CUERPO Y POOL (seguridad, 2026-09-14). Un fd solo vuelve al pool
+// si el cuerpo de ESTA respuesta se leyó completo y su fin era conocido; si no,
+// los bytes pendientes quedaban en el socket y el SIGUIENTE pedido que tomaba ese
+// fd —quizá de otro usuario— los leía como su respuesta. Antes solo se leía con
+// `Content-Length` exacto en mayúsculas. Ahora, según RFC 9112 §6.3:
+//   - HEAD, 1xx, 204 y 304 no tienen cuerpo (los 1xx provisionales se saltan);
+//   - Transfer-Encoding con `chunked` final se lee hasta el chunk 0 y trailers;
+//     con TE y Content-Length a la vez gana chunked y el fd NO se reusa
+//     (señal de request smuggling);
+//   - Content-Length válido se lee exacto; si llegan menos bytes, 502;
+//   - sin longitud: delimitado por cierre — se lee hasta EOF con plazo y tope,
+//     y el fd se descarta siempre.
+// Las cabeceras se comparan sin mayúsculas. Chunked se DESAGRUPA y se reemite
+// con Content-Length: el gateway escribe la respuesta entera de una vez y la
+// cache guarda respuestas con longitud (el «off-by-8»), así que reemitir chunked
+// obligaría a enseñarle ese encuadre a los dos sin ganar nada.
 fn read_upstream_response(upstream_idx: int, fd: int) -> Array {
-    let status_line: String = tcp_read_line(fd)
+    return read_upstream_response_m(upstream_idx, "GET", fd)
+}
+
+fn upstream_bad(fd: int, msg: String) -> Array {
+    pool_discard(fd)
+    let r: String = http_response(502, "Bad Gateway: " + msg)
+    return [r, 0]
+}
+
+// Entero decimal no negativo; -1 si no lo es.
+fn parse_decimal_len(v: String) -> int {
+    let s: String = v.trim()
+    let n: int = str_byte_length(s)
+    if n == 0 or n > 18 {
+        return -1
+    }
+    var r: int = 0
+    var i: int = 0
+    while i < n {
+        let c: int = s.charAt(i)
+        if c < 48 or c > 57 {
+            return -1
+        }
+        r = r * 10 + (c - 48)
+        i = i + 1
+    }
+    return r
+}
+
+// Tamaño de chunk en hexadecimal, con extensiones `;...` opcionales; -1 si es inválido.
+fn parse_chunk_size(line: String) -> int {
+    var s: String = line
+    let semi: int = s.indexOf(";")
+    if semi >= 0 {
+        s = s.substring(0, semi)
+    }
+    s = s.trim()
+    let n: int = str_byte_length(s)
+    if n == 0 or n > 15 {
+        return -1
+    }
+    var v: int = 0
+    var i: int = 0
+    while i < n {
+        let c: int = s.charAt(i)
+        var d: int = -1
+        if c >= 48 and c <= 57 {
+            d = c - 48
+        } else if c >= 97 and c <= 102 {
+            d = c - 87
+        } else if c >= 65 and c <= 70 {
+            d = c - 55
+        }
+        if d < 0 {
+            return -1
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+// "HTTP/1.1 NNN reason" -> NNN; <= 0 si la status-line está mal formada.
+fn status_code_of(status_line: String) -> int {
+    let sp: int = status_line.indexOf(" ")
+    if sp < 0 {
+        return 0
+    }
+    if str_byte_length(status_line) < sp + 4 {
+        return 0
+    }
+    let digits: String = status_line.substring(sp + 1, sp + 4)
+    return parse_decimal_len(digits)
+}
+
+// Cuerpo chunked completo. Retorna [1, cuerpo, reusable] o [0, motivo, 0].
+// reusable=0 cuando el upstream cerró entre el chunk 0 y la línea vacía final:
+// el cuerpo ya está entero, pero ese fd está muerto y en el pool haría fallar
+// al pedido siguiente (un POST no se reintenta: le tocaría un 502 ajeno).
+// `tcp_read_line` devuelve "" tanto en línea vacía como en EOF, por eso los
+// trailers se leen con la variante Result, que separa los dos casos.
+fn read_chunked_body(fd: int) -> Array {
+    var body: String = ""
+    var total: int = 0
+    while 1 > 0 {
+        let size_line: String = tcp_read_line(fd)
+        let size: int = parse_chunk_size(size_line)
+        if size < 0 {
+            return [0, "invalid chunk size from upstream", 0]
+        }
+        if size == 0 {
+            var tdone: int = 0
+            var t_reusable: int = 1
+            while tdone == 0 {
+                match try_tcp_read_line(fd) {
+                    Result.Ok(t) => {
+                        if t.length() == 0 {
+                            tdone = 1
+                        }
+                    }
+                    Result.Err(e) => {
+                        t_reusable = 0
+                        tdone = 1
+                    }
+                }
+            }
+            return [1, body, t_reusable]
+        }
+        if total + size > g_upstream_max_body {
+            return [0, "chunked response exceeds the proxy limit", 0]
+        }
+        let data: String = tcp_read(fd, size)
+        if str_byte_length(data) != size {
+            return [0, "truncated chunk from upstream", 0]
+        }
+        body = body + data
+        total = total + size
+        let term: String = tcp_read_line(fd)
+        if term.length() != 0 {
+            return [0, "malformed chunk terminator from upstream", 0]
+        }
+    }
+    return [0, "unreachable", 0]
+}
+
+// Cuerpo delimitado por cierre, con plazo de INACTIVIDAD y tope. El plazo es
+// SO_RCVTIMEO: vence si el upstream pasa ese tiempo sin mandar un byte, no es una
+// duración total (un goteo lento sigue hasta el tope). Retorna [1, cuerpo] o [0, motivo].
+fn read_until_close(fd: int) -> Array {
+    tcp_set_timeout(fd, g_upstream_close_timeout_s)
+    var body: String = ""
+    var total: int = 0
+    var fin: int = 0
+    var chunk: String = ""
+    var err_kind: String = ""
+    while fin == 0 {
+        chunk = ""
+        match try_tcp_read_partial(fd, 65536) {
+            Result.Ok(s) => { chunk = s }
+            Result.Err(e) => { err_kind = e.kind }
+        }
+        if err_kind.length() > 0 {
+            return [0, "response without length idle for " + int_to_string(g_upstream_close_timeout_s) + "s (" + err_kind + ")"]
+        }
+        let clen: int = str_byte_length(chunk)
+        if clen == 0 {
+            fin = 1
+        } else {
+            total = total + clen
+            if total > g_upstream_max_body {
+                return [0, "response without length exceeds the proxy limit"]
+            }
+            body = body + chunk
+        }
+    }
+    return [1, body]
+}
+
+fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array {
+    var status_line: String = tcp_read_line(fd)
     if status_line.length() == 0 {
         pool_discard(fd)
         let stale_resp: String = http_response(502, "Bad Gateway: empty response from upstream")
         return [stale_resp, 1]
     }
+    var code: int = status_code_of(status_line)
 
-    // Read response headers
+    // Headers (y respuestas 1xx provisionales, que se saltan)
     var resp_headers: Array = []
-    var content_length: int = 0
-    var upstream_closes: int = 0
-    while 1 > 0 {
-        let line: String = tcp_read_line(fd)
-        if line.length() == 0 {
-            break
-        }
-        let colon_idx: int = line.indexOf(": ")
-        if colon_idx >= 0 {
-            let key: String = line.substring(0, colon_idx)
-            let val: String = line.substring(colon_idx + 2, line.length())
-            resp_headers.push(key)
-            resp_headers.push(val)
-            if key == "Content-Length" {
-                content_length = string_to_int(val)
+    var cl_raw: String = ""
+    var cl_conflict: int = 0
+    var te_raw: String = ""
+    var conn_close: int = 0
+    var conn_keepalive: int = 0
+    var interim: int = 1
+    var hdone: int = 0
+    while interim == 1 {
+        resp_headers = []
+        cl_raw = ""
+        cl_conflict = 0
+        te_raw = ""
+        conn_close = 0
+        conn_keepalive = 0
+        hdone = 0
+        while hdone == 0 {
+            let line: String = tcp_read_line(fd)
+            if line.length() == 0 {
+                hdone = 1
+            } else {
+                let colon_idx: int = line.indexOf(":")
+                if colon_idx > 0 {
+                    let key: String = line.substring(0, colon_idx)
+                    let raw_val: String = line.substring(colon_idx + 1, line.length())
+                    let val: String = raw_val.trim()
+                    let kl: String = key.toLower()
+                    if kl == "content-length" {
+                        if cl_raw.length() > 0 and cl_raw != val {
+                            cl_conflict = 1
+                        }
+                        cl_raw = val
+                    } else if kl == "transfer-encoding" {
+                        if te_raw.length() > 0 {
+                            te_raw = te_raw + ", " + val
+                        } else {
+                            te_raw = val
+                        }
+                    } else if kl == "connection" {
+                        let vl: String = val.toLower()
+                        if vl.indexOf("close") >= 0 {
+                            conn_close = 1
+                        }
+                        if vl.indexOf("keep-alive") >= 0 {
+                            conn_keepalive = 1
+                        }
+                    }
+                    resp_headers.push(key)
+                    resp_headers.push(val)
+                }
             }
-            // Honor upstream's Connection: close — don't pool a fd the server
-            // is about to close. Without this the pool hands out dead fds on
-            // the next request, producing 502 "empty response from upstream"
-            // for every other request against HTTP/1.0-style backends.
-            if key == "Connection" and val == "close" {
-                upstream_closes = 1
-            }
         }
+        if code >= 100 and code < 200 and code != 101 {
+            status_line = tcp_read_line(fd)
+            if status_line.length() == 0 {
+                return upstream_bad(fd, "upstream closed after an interim 1xx response")
+            }
+            code = status_code_of(status_line)
+        } else {
+            interim = 0
+        }
+    }
+    if code <= 0 {
+        return upstream_bad(fd, "malformed status line from upstream")
+    }
+
+    // Honor upstream's Connection: close (en cualquier capitalización) y el
+    // default de HTTP/1.0 — don't pool a fd the server is about to close.
+    var reusable: int = 1
+    if conn_close == 1 {
+        reusable = 0
+    }
+    if status_line.startsWith("HTTP/1.0") and conn_keepalive == 0 {
+        reusable = 0
+    }
+    if code == 101 {
+        reusable = 0
+    }
+    var no_body: int = 0
+    if method == "HEAD" or code == 204 or code == 304 or code < 200 {
+        no_body = 1
     }
 
     // Read response body
     var resp_body: String = ""
-    if content_length > 0 {
-        resp_body = tcp_read(fd, content_length)
+    if no_body == 0 {
+        if te_raw.length() > 0 {
+            if cl_raw.length() > 0 {
+                reusable = 0
+            }
+            let te_low: String = te_raw.toLower()
+            if te_low.endsWith("chunked") {
+                let cr: Array = read_chunked_body(fd)
+                let c_ok: int = cr[0]
+                let c_data: String = cr[1]
+                if c_ok != 1 {
+                    return upstream_bad(fd, c_data)
+                }
+                let c_reusable: int = cr[2]
+                if c_reusable != 1 {
+                    reusable = 0
+                }
+                resp_body = c_data
+            } else {
+                reusable = 0
+                let ur: Array = read_until_close(fd)
+                let u_ok: int = ur[0]
+                let u_data: String = ur[1]
+                if u_ok != 1 {
+                    return upstream_bad(fd, u_data)
+                }
+                resp_body = u_data
+            }
+        } else if cl_raw.length() > 0 {
+            if cl_conflict == 1 {
+                return upstream_bad(fd, "conflicting Content-Length headers from upstream")
+            }
+            let content_length: int = parse_decimal_len(cl_raw)
+            if content_length < 0 {
+                return upstream_bad(fd, "invalid Content-Length from upstream")
+            }
+            if content_length > 0 {
+                resp_body = tcp_read(fd, content_length)
+                if str_byte_length(resp_body) != content_length {
+                    return upstream_bad(fd, "truncated response body from upstream")
+                }
+            }
+        } else {
+            reusable = 0
+            let ur2: Array = read_until_close(fd)
+            let u2_ok: int = ur2[0]
+            let u2_data: String = ur2[1]
+            if u2_ok != 1 {
+                return upstream_bad(fd, u2_data)
+            }
+            resp_body = u2_data
+        }
     }
 
-    // Return fd to pool for reuse — unless upstream is closing it
-    if upstream_closes == 1 {
-        pool_discard(fd)
-    } else {
+    // Return fd to pool for reuse — solo con el cuerpo leído entero y su fin conocido
+    if reusable == 1 {
         pool_put(upstream_idx, fd)
+    } else {
+        pool_discard(fd)
     }
 
     // Build response to client
@@ -241,10 +549,23 @@ fn read_upstream_response(upstream_idx: int, fd: int) -> Array {
     while ri + 1 < resp_headers.length() {
         let rk: String = resp_headers[ri]
         let rv: String = resp_headers[ri + 1]
-        if rk != "Connection" {
+        let rkl: String = rk.toLower()
+        var keep: int = 1
+        if rkl == "connection" {
+            keep = 0
+        }
+        if no_body == 0 {
+            if rkl == "content-length" or rkl == "transfer-encoding" {
+                keep = 0
+            }
+        }
+        if keep == 1 {
             response = response + rk + ": " + rv + crlf
         }
         ri = ri + 2
+    }
+    if no_body == 0 {
+        response = response + "Content-Length: " + int_to_string(str_byte_length(resp_body)) + crlf
     }
 
     response = response + "Connection: keep-alive" + crlf
