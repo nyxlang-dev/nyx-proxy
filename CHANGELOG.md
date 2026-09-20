@@ -3,6 +3,69 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.4 — 2026-09-20
+
+**Una respuesta `text/event-stream` ahora se transmite en vivo en vez de juntarse
+hasta que el upstream cierre.** [arco: sse-tunnel]
+
+- `src/router.nx` — **túnel SSE de un solo sentido**. `std/serve` emite un canal
+  SSE sin `Content-Length` y sin `chunked`, con el cuerpo terminado por FIN TCP.
+  El router lo trataba como «cuerpo hasta el cierre»: lo juntaba entero, con un
+  plazo de INACTIVIDAD de 30 s y un tope de 16 MiB. Pero el heartbeat de
+  `std/serve` (`:\n\n` cada 15 s) renueva ese plazo indefinidamente, así que el
+  gateway acumulaba en silencio y el navegador no recibía NINGÚN evento hasta que
+  el upstream cerrara. Medido antes del fix, con un upstream que cierra a los
+  3 s: la respuesta volvía a los 3016 ms, con todo junto; con los valores de
+  producción (plazo de 30 s y un canal que no cierra), no volvía nunca — la
+  corrida moría por el timeout de 60 s del runner sin imprimir una línea. Ahora
+  una respuesta con `Content-Type: text/event-stream` y sin longitud declarada se
+  tuneliza: el primer evento llega a los 2 ms y la pausa entre eventos del
+  upstream se preserva en el cliente (medido: 500 ms de pausa → 502 ms).
+- El túnel es **de un solo sentido y sin threads ni mutex**, a diferencia de
+  `ws_tunnel`, que es bidireccional y por eso necesita 2 threads y un lock sobre
+  el `SSL*`. En SSE el cliente no manda nada después del GET, así que un segundo
+  thread solo existiría para bloquearse; con un único thread tocando el SSL
+  tampoco aplica el caveat de NewSessionTicket. La asimetría es deliberada y está
+  comentada en el código.
+- **El fd de un stream nunca vuelve al pool**, y el cierre del cliente se detecta
+  en ~2 s (medido: 402 ms en el test) por dos vías independientes: una sonda en
+  el ciclo ocioso —cuando el upstream no tenía nada que relayar, así que no
+  retrasa ningún evento— y el resultado de la escritura. Detectarlo solo por la
+  escritura habría tardado entre 15 y 30 s por cliente que cierra la pestaña,
+  con un worker clavado todo ese rato.
+- **Tope de túneles simultáneos** (`sse_set_max_tunnels`, default 1024): cada
+  túnel retiene el worker que lo atiende, así que sin tope N clientes SSE dejan
+  al gateway sin workers — no degradado, mudo. Al exceder se responde un 503
+  explícito y contabilizado. OJO: el techo EFECTIVO es la cantidad de workers, no
+  este número; el valor sirve para que el modo de falla sea un 503 y no una
+  desaparición, y para darle la perilla a quien opera.
+- `proxy_dispatch_c(raw, ssl_handle, client_fd)` es la variante con el socket del
+  cliente a la vista, que es lo que permite tunelizar; devuelve `""` cuando ya no
+  queda nada que escribir. `proxy_dispatch(raw)` queda como el nombre de siempre,
+  sin sink y sin túnel. Igual `forward_pooled` y `read_upstream_response_m`: con
+  el túnel apagado ni se mira el `Content-Type`, y el camino del pool queda
+  byte-idéntico al de v0.4.3.
+- Suite nueva `tests/test_proxy_sse_tunnel.nx` (8 casos): detección sin leer el
+  cuerpo, relay en orden y sin buffering (se verifica que la pausa del upstream
+  se PRESERVE, porque si se bufferizara los eventos llegarían juntos al final),
+  cliente que se va, el pedido siguiente por el mismo pool, no regresión de una
+  respuesta sin longitud que no es SSE, matching del `Content-Type`, SSE con
+  longitud y el tope.
+- **Alcance acotado, a propósito**: se tuneliza por `Content-Type`, no toda
+  respuesta sin longitud. Un SSE que venga CON `Content-Length` o `chunked` se
+  sirve encuadrado y su fd sigue siendo reusable (`std/serve` nunca manda
+  ninguno de los dos). Una respuesta sin longitud que no es SSE se comporta
+  igual que en v0.4.3: se junta con plazo y tope, y el fd se descarta.
+- **fix (build)**: `nyx build` estaba ROTO desde que el toolchain llegó a 0.32.4,
+  que empezó a exigir `pub` para cruzar el límite de módulo. `proxy_dispatch` y
+  `ws_proxy` no lo tenían, así que ni el binario de referencia ni el ejemplo
+  `gateway-tls` compilaban — y los dos están en CI. No lo cazó nadie porque el
+  binario commiteado era anterior al cambio del compilador.
+- Fuera de alcance, sin cambio: el `access_log` y las métricas de un túnel se
+  emiten al ABRIR, con la latencia hasta la cabecera. Registrarlas al cerrar
+  metería la duración entera del stream en el histograma y destruiría el p99 del
+  vhost. Un túnel no emite una segunda línea al terminar.
+
 ## v0.4.3 — 2026-09-15
 
 **SEGURIDAD: el pool de conexiones al upstream podía entregarle a un pedido los

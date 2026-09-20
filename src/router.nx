@@ -83,6 +83,67 @@ fn upstream_set_close_timeout(seconds: int) {
     g_upstream_close_timeout_s = seconds
 }
 
+// Tope de túneles SSE simultáneos. Cada túnel retiene el worker que lo atiende
+// mientras el stream vive, así que sin tope N clientes SSE dejan al gateway sin
+// workers: no degradado, MUDO. El valor real lo pone el consumer según sus
+// workers (el gateway de producción usa la mitad de los suyos). OJO: el techo
+// EFECTIVO es la cantidad de workers, no este número — al exceder se responde un
+// 503 explícito y contabilizado, que es la diferencia entre fallar y desaparecer.
+var g_sse_max_tunnels: int = 1024
+var g_sse_open: Array = [0]
+var g_sse_mtx: Map = Map.new()
+var g_sse_mtx_init: int = 0
+
+// Cadencia del loop del túnel (s): cada cuánto se despierta si el upstream está
+// callado, que es cuando se sondea si el cliente sigue ahí. No agrega latencia a
+// ningún evento: `recv` vuelve apenas hay un byte, no espera el plazo.
+var g_sse_idle_s: int = 1
+
+pub fn sse_set_max_tunnels(n: int) {
+    g_sse_max_tunnels = n
+}
+
+fn sse_init() {
+    if g_sse_mtx_init == 1 {
+        return 0
+    }
+    g_sse_mtx = mutex_new()
+    g_sse_mtx_init = 1
+    return 0
+}
+
+// Túneles SSE abiertos ahora (tests y diagnóstico).
+pub fn sse_open_count() -> int {
+    sse_init()
+    mutex_lock(g_sse_mtx)
+    let n: int = g_sse_open[0]
+    mutex_unlock(g_sse_mtx)
+    return n
+}
+
+// 1 = hay cupo y queda reservado; 0 = lleno. Reserva y liberación van EN PARES
+// dentro de sse_tunnel, para que no exista un camino que reserve y no libere.
+fn sse_reserve() -> int {
+    sse_init()
+    mutex_lock(g_sse_mtx)
+    let n: int = g_sse_open[0]
+    if n >= g_sse_max_tunnels {
+        mutex_unlock(g_sse_mtx)
+        return 0
+    }
+    g_sse_open[0] = n + 1
+    mutex_unlock(g_sse_mtx)
+    return 1
+}
+
+fn sse_release() {
+    sse_init()
+    mutex_lock(g_sse_mtx)
+    g_sse_open[0] = g_sse_open[0] - 1
+    mutex_unlock(g_sse_mtx)
+    return 0
+}
+
 // Inyecta X-Forwarded-For / X-Real-IP en un array de headers parseados
 // [k1, v1, k2, v2, ...]. El gateway (que tiene la IP vía getpeername) llama
 // esto ANTES de proxy_dispatch/ws_proxy; forward_pooled y el handshake WS
@@ -120,7 +181,7 @@ pub fn inject_forwarded_headers(headers: Array, client_ip: String) -> Array {
 }
 
 // Forward request to backend using pooled connection
-fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
+fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend, tunnel_ok: int) -> Array {
     var fd: int = pool_get(idx, backend.host, backend.port)
     if fd < 0 {
         // Fallo de conexion INICIAL (pool vacio y tcp_connect fallo dentro
@@ -129,7 +190,7 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
         // metodo (a diferencia del caso status-line-vacia mas abajo).
         fd = tcp_connect(backend.host, backend.port)
         if fd < 0 {
-            return http_response(502, "Bad Gateway: cannot connect to upstream")
+            return [http_response(502, "Bad Gateway: cannot connect to upstream"), -1]
         }
     }
 
@@ -167,16 +228,17 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
         pool_discard(fd)
         let fd2: int = tcp_connect(backend.host, backend.port)
         if fd2 < 0 {
-            return http_response(502, "Bad Gateway: cannot connect to upstream")
+            return [http_response(502, "Bad Gateway: cannot connect to upstream"), -1]
         }
         tcp_write(fd2, req)
-        let res2: Array = read_upstream_response_m(idx, method, fd2)
-        return res2[0]
+        let res2: Array = read_upstream_response_mc(idx, method, fd2, tunnel_ok)
+        return [res2[0], res2[2]]
     }
 
-    let res: Array = read_upstream_response_m(idx, method, fd)
+    let res: Array = read_upstream_response_mc(idx, method, fd, tunnel_ok)
     let resp: String = res[0]
     let was_stale: int = res[1]
+    let sse_fd: int = res[2]
     if was_stale == 1 {
         // Status-line vacia: no se leyo NI UN byte de vuelta. Post-restart
         // del upstream esto es el caso tipico (la conexion pooled murio
@@ -190,20 +252,28 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
         if method == "GET" or method == "HEAD" or method == "OPTIONS" {
             let fd3: int = tcp_connect(backend.host, backend.port)
             if fd3 < 0 {
-                return resp
+                return [resp, -1]
             }
             let written3: int = tcp_write(fd3, req)
             if written3 <= 0 {
                 pool_discard(fd3)
-                return resp
+                return [resp, -1]
             }
-            let res3: Array = read_upstream_response_m(idx, method, fd3)
-            return res3[0]
+            let res3: Array = read_upstream_response_mc(idx, method, fd3, tunnel_ok)
+            return [res3[0], res3[2]]
         }
-        return resp
+        return [resp, -1]
     }
-    return resp
+    return [resp, sse_fd]
 }
+
+// Nombre viejo: String, sin túnel. Lo usan los 11 casos de
+// test_proxy_pool_framing directamente, así que su contrato no se toca.
+fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
+    let r: Array = forward_pooled_c(idx, method, path, headers, body, backend, 0)
+    return r[0]
+}
+
 
 // Read response from upstream. Retorna [response, was_stale] — was_stale=1
 // cuando la status-line vino vacia (NI UN byte leido: conexion pooled
@@ -234,6 +304,12 @@ fn upstream_bad(fd: int, msg: String) -> Array {
     pool_discard(fd)
     let r: String = http_response(502, "Bad Gateway: " + msg)
     return [r, 0]
+}
+
+// Igual, para la variante de 3 elementos: no hay fd que tunelizar (-1).
+fn upstream_bad_t(fd: int, msg: String) -> Array {
+    let r: Array = upstream_bad(fd, msg)
+    return [r[0], r[1], -1]
 }
 
 // Entero decimal no negativo; -1 si no lo es.
@@ -300,6 +376,22 @@ fn status_code_of(status_line: String) -> int {
     }
     let digits: String = status_line.substring(sp + 1, sp + 4)
     return parse_decimal_len(digits)
+}
+
+// ¿El Content-Type de la respuesta es un canal SSE? Se corta en el primer `;`
+// porque el valor real trae parámetros (`text/event-stream; charset=utf-8`), y se
+// compara por IGUALDAD, no por prefijo: `text/event-streamx` es otro tipo y con
+// startsWith entraría al túnel.
+fn is_event_stream(ct: String) -> int {
+    var base: String = ct
+    let semi: int = ct.indexOf(";")
+    if semi >= 0 {
+        base = ct.substring(0, semi)
+    }
+    if base.trim().toLower() == "text/event-stream" {
+        return 1
+    }
+    return 0
 }
 
 // Cuerpo chunked completo. Retorna [1, cuerpo, reusable] o [0, motivo, 0].
@@ -385,12 +477,12 @@ fn read_until_close(fd: int) -> Array {
     return [1, body]
 }
 
-fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array {
+fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_ok: int) -> Array {
     var status_line: String = tcp_read_line(fd)
     if status_line.length() == 0 {
         pool_discard(fd)
         let stale_resp: String = http_response(502, "Bad Gateway: empty response from upstream")
-        return [stale_resp, 1]
+        return [stale_resp, 1, -1]
     }
     var code: int = status_code_of(status_line)
 
@@ -399,6 +491,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
     var cl_raw: String = ""
     var cl_conflict: int = 0
     var te_raw: String = ""
+    var ct_raw: String = ""
     var conn_close: int = 0
     var conn_keepalive: int = 0
     var interim: int = 1
@@ -408,6 +501,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
         cl_raw = ""
         cl_conflict = 0
         te_raw = ""
+        ct_raw = ""
         conn_close = 0
         conn_keepalive = 0
         hdone = 0
@@ -433,6 +527,8 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
                         } else {
                             te_raw = val
                         }
+                    } else if kl == "content-type" {
+                        ct_raw = val
                     } else if kl == "connection" {
                         let vl: String = val.toLower()
                         if vl.indexOf("close") >= 0 {
@@ -450,7 +546,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
         if code >= 100 and code < 200 and code != 101 {
             status_line = tcp_read_line(fd)
             if status_line.length() == 0 {
-                return upstream_bad(fd, "upstream closed after an interim 1xx response")
+                return upstream_bad_t(fd, "upstream closed after an interim 1xx response")
             }
             code = status_code_of(status_line)
         } else {
@@ -458,7 +554,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
         }
     }
     if code <= 0 {
-        return upstream_bad(fd, "malformed status line from upstream")
+        return upstream_bad_t(fd, "malformed status line from upstream")
     }
 
     // Honor upstream's Connection: close (en cualquier capitalización) y el
@@ -478,6 +574,41 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
         no_body = 1
     }
 
+    // ── Canal SSE: el cuerpo NO se lee acá, se tuneliza ──────────────────────
+    // Solo si el caller tiene a quién escribirle (tunnel_ok). Con el flag
+    // apagado —standalone, un worker sin sink, los tests de encuadre— ni se
+    // evalúa el Content-Type y el camino de abajo queda byte-idéntico al de
+    // antes de este cambio.
+    //
+    // Se exige AUSENCIA de Content-Length y de Transfer-Encoding: si el upstream
+    // encuadró la respuesta, el encuadre alcanza y el fd puede seguir en el pool.
+    // `std/serve` nunca manda ninguno de los dos, así que el camino real entra
+    // entero. El fd se devuelve SIN pool_put ni pool_discard: de cerrarlo se
+    // encarga el túnel, y volver al pool es justamente lo que no puede pasar.
+    if tunnel_ok == 1 and no_body == 0 and cl_raw.length() == 0 and te_raw.length() == 0 and is_event_stream(ct_raw) == 1 {
+        let crlf_s: String = "\r\n"
+        var head: String = status_line + crlf_s
+        var si: int = 0
+        while si + 1 < resp_headers.length() {
+            let sk: String = resp_headers[si]
+            let sv: String = resp_headers[si + 1]
+            let skl: String = sk.toLower()
+            // Se filtran las tres de encuadre y se relaya todo lo demás tal
+            // cual: Content-Type, Cache-Control y X-Accel-Buffering vienen del
+            // upstream y son justamente lo que evita que el cliente bufferice.
+            // NO se puede reusar la reemisión normal de más abajo: recalcula un
+            // Content-Length que acá no existe (el cuerpo puede ser infinito) y
+            // pone Connection: keep-alive, que sin longitud deja al cliente sin
+            // ningún delimitador de cuerpo.
+            if skl != "connection" and skl != "content-length" and skl != "transfer-encoding" {
+                head = head + sk + ": " + sv + crlf_s
+            }
+            si = si + 2
+        }
+        head = head + "Connection: close" + crlf_s + crlf_s
+        return [head, 0, fd]
+    }
+
     // Read response body
     var resp_body: String = ""
     if no_body == 0 {
@@ -491,7 +622,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
                 let c_ok: int = cr[0]
                 let c_data: String = cr[1]
                 if c_ok != 1 {
-                    return upstream_bad(fd, c_data)
+                    return upstream_bad_t(fd, c_data)
                 }
                 let c_reusable: int = cr[2]
                 if c_reusable != 1 {
@@ -504,22 +635,22 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
                 let u_ok: int = ur[0]
                 let u_data: String = ur[1]
                 if u_ok != 1 {
-                    return upstream_bad(fd, u_data)
+                    return upstream_bad_t(fd, u_data)
                 }
                 resp_body = u_data
             }
         } else if cl_raw.length() > 0 {
             if cl_conflict == 1 {
-                return upstream_bad(fd, "conflicting Content-Length headers from upstream")
+                return upstream_bad_t(fd, "conflicting Content-Length headers from upstream")
             }
             let content_length: int = parse_decimal_len(cl_raw)
             if content_length < 0 {
-                return upstream_bad(fd, "invalid Content-Length from upstream")
+                return upstream_bad_t(fd, "invalid Content-Length from upstream")
             }
             if content_length > 0 {
                 resp_body = tcp_read(fd, content_length)
                 if str_byte_length(resp_body) != content_length {
-                    return upstream_bad(fd, "truncated response body from upstream")
+                    return upstream_bad_t(fd, "truncated response body from upstream")
                 }
             }
         } else {
@@ -528,7 +659,7 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
             let u2_ok: int = ur2[0]
             let u2_data: String = ur2[1]
             if u2_ok != 1 {
-                return upstream_bad(fd, u2_data)
+                return upstream_bad_t(fd, u2_data)
             }
             resp_body = u2_data
         }
@@ -571,8 +702,18 @@ fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array
     response = response + "Connection: keep-alive" + crlf
     response = response + crlf + resp_body
 
-    return [response, 0]
+    return [response, 0, -1]
 }
+
+// Variante de 3 elementos, con el destino del fd decidido por el caller. El
+// nombre viejo queda como wrapper de 2 elementos con el túnel APAGADO: los 11
+// casos de test_proxy_pool_framing y cualquier consumer sin socket de cliente a
+// mano siguen viendo exactamente el contrato de antes.
+fn read_upstream_response_m(upstream_idx: int, method: String, fd: int) -> Array {
+    let r: Array = read_upstream_response_mc(upstream_idx, method, fd, 0)
+    return [r[0], r[1]]
+}
+
 
 // Detect MIME type from file extension
 fn detect_mime_type(file_path: String) -> String {
@@ -751,11 +892,178 @@ fn ws_tunnel(ssl_handle: int, up_fd: int) {
     return 0
 }
 
+// ── Túnel SSE: UN SOLO SENTIDO, upstream → cliente ───────────────────────────
+//
+// ASIMETRÍA DELIBERADA con ws_tunnel, que está acá arriba: aquel es
+// BIDIRECCIONAL y por eso necesita 2 threads y el `ssl_mtx`. En SSE el cliente
+// no manda NADA después del GET, así que un segundo thread solo existiría para
+// bloquearse leyendo un socket mudo. Un único thread toca el SSL ⇒ no hace falta
+// mutex, y NO aplica el caveat de NewSessionTicket (nunca hay un read bloqueante
+// compitiendo con un write bajo el mismo lock). Si alguien viene a "unificar las
+// dos", esto es lo que se pierde.
+//
+// La muerte del cliente se detecta por DOS vías independientes, las dos gratis:
+// la sonda del ciclo ocioso (cuando el upstream no tenía nada que relayar, así
+// que no retrasa ningún byte real) y el resultado de la escritura, que hay que
+// mirar igual. No alcanza con la segunda sola: con el heartbeat de 15 s de
+// `std/serve`, y sabiendo que el primer write tras un cierre normal entra al
+// buffer del kernel y recién falla el segundo, un cliente que cierra la pestaña
+// tardaría entre 15 y 30 s en notarse — con un worker clavado todo ese rato.
+//
+// PROPIEDAD DE LOS SOCKETS, otra diferencia con ws_tunnel: esta función es dueña
+// SOLO de up_fd (shutdown + close). El socket del cliente lo cierra el CALLER,
+// como en todo el camino de proxy_dispatch: ws_tunnel cierra el SSL porque
+// ws_proxy le transfiere la conexión entera, acá no, y cerrarlo sería un doble
+// free contra el tls_close_conn del worker.
+
+// Escritura al cliente, indistinta del transporte. Devuelve bytes escritos.
+fn sse_client_write(ssl_handle: int, client_fd: int, s: String) -> int {
+    if ssl_handle > 0 {
+        return tls_write_conn(ssl_handle, s)
+    }
+    return tcp_write(client_fd, s)
+}
+
+// 1 = el cliente sigue vivo; 0 = se fue.
+fn sse_client_alive(ssl_handle: int, client_fd: int) -> int {
+    if ssl_handle > 0 {
+        let w: int = tls_wait_readable(ssl_handle, 0)
+        if w < 0 {
+            return 0
+        }
+        if w == 1 {
+            // OBLIGATORIO consumir: tls_wait_readable cortocircuita en su buffer
+            // propio y en SSL_pending ANTES de mirar el flag de EOF, y ese flag
+            // solo lo setea tls_read_nonblock. Sin este read, un peer que ya
+            // mandó close_notify devuelve 1 para siempre = busy-spin al 100%.
+            // Lo leído se DESCARTA: un cliente SSE no habla, y la respuesta va
+            // con `Connection: close`, así que no hay pedido siguiente que
+            // pudiera venir pipelineado acá.
+            let junk: String = tls_read_nonblock(ssl_handle, 4096)
+            if junk.length() >= 0 {
+                return 1
+            }
+        }
+        return 1
+    }
+    // Camino plano: NO existe un `tcp_wait_readable` en el runtime, así que la
+    // sonda es un read de 1 byte contra el SO_RCVTIMEO ya puesto. Es correcta
+    // (nunca pierde bytes) pero menos fina que el poll de 0 ms del lado TLS.
+    var alive: int = 1
+    match try_tcp_read_partial(client_fd, 1) {
+        Result.Ok(s) => {
+            // Ok("") es EOF limpio e inambiguo en la variante Result: el cliente
+            // cerró. Ok(datos) sería pipelining, que acá se descarta.
+            if str_byte_length(s) == 0 {
+                alive = 0
+            }
+        }
+        Result.Err(e) => {
+            // 11 = EAGAIN: venció el plazo y el cliente sigue vivo y callado,
+            // que es el caso NORMAL en SSE. Se discrimina por `code` y no por
+            // `kind` a propósito: el 11 no está en errno_to_kind y cae al
+            // catch-all "io", indistinguible de un error de verdad.
+            if e.code != 11 {
+                alive = 0
+            }
+        }
+    }
+    return alive
+}
+
+// Relaya el stream hasta que cualquiera de los dos extremos corte.
+// Devuelve 0 = el túnel corrió (y up_fd quedó cerrado);
+//          1 = RECHAZADO por cupo (up_fd ya descartado, el caller manda 503).
+fn sse_tunnel(ssl_handle: int, client_fd: int, up_fd: int, head: String) -> int {
+    if sse_reserve() == 0 {
+        pool_discard(up_fd)
+        return 1
+    }
+
+    // El SO_RCVTIMEO del upstream ES el reloj del loop. OJO: un valor <= 0 lo
+    // DESACTIVA (bloqueo indefinido), así que 1 es el mínimo utilizable.
+    tcp_set_timeout(up_fd, g_sse_idle_s)
+    if ssl_handle <= 0 {
+        // Plano: acota la sonda Y el send() contra un cliente trabado. Del lado
+        // TLS no hace falta, tls_accept ya dejó su propio plazo en el fd.
+        tcp_set_timeout(client_fd, g_sse_idle_s + 1)
+    }
+
+    // La cabecera se escribe ACÁ y no en el caller, para que la reserva y la
+    // liberación del cupo queden emparejadas dentro de una sola función.
+    var done: int = 0
+    let hlen: int = str_byte_length(head)
+    if sse_client_write(ssl_handle, client_fd, head) != hlen {
+        done = 1
+    }
+
+    while done == 0 {
+        var chunk: String = ""
+        var eof: int = 0
+        var err: int = 0
+        var ecode: int = 0
+        // Drena primero lo que tcp_read_line dejó en el buffer de conexión al
+        // parsear las cabeceras: los bytes del primer evento que viajaron en el
+        // MISMO segmento que la cabecera no se pierden.
+        match try_tcp_read_partial(up_fd, 65536) {
+            Result.Ok(s) => {
+                if str_byte_length(s) == 0 {
+                    eof = 1
+                } else {
+                    chunk = s
+                }
+            }
+            Result.Err(e) => {
+                err = 1
+                ecode = e.code
+            }
+        }
+
+        if eof == 1 {
+            // EOF limpio del upstream: fin NORMAL del stream. `std/serve` manda
+            // `: cierre\n\n` y después el FIN.
+            done = 1
+        } else if err == 1 {
+            if ecode == 11 {
+                // EAGAIN: venció el tick sin datos, el caso normal entre
+                // heartbeats. ÚNICO momento en que se sondea al cliente.
+                if sse_client_alive(ssl_handle, client_fd) == 0 {
+                    done = 1
+                }
+            } else {
+                done = 1
+            }
+        } else {
+            let want: int = str_byte_length(chunk)
+            let wrote: int = sse_client_write(ssl_handle, client_fd, chunk)
+            // Comparar contra el largo esperado, NUNCA `wrote > 0`: tls_write_conn
+            // puede devolver una escritura PARCIAL si un SSL_write intermedio
+            // falla, y un frame SSE partido a la mitad no se puede reanudar.
+            if wrote != want {
+                done = 1
+            }
+        }
+    }
+
+    if ssl_handle <= 0 {
+        // Devolver el socket aceptado a su bloqueo indefinido original.
+        tcp_set_timeout(client_fd, 0)
+    }
+    // shutdown antes del close: el FIN sale YA y el upstream saca este fd de su
+    // registro en su próxima escritura, en vez de seguir latiendo contra un
+    // socket muerto. (Acá no hay un segundo thread que despertar — ese es el
+    // motivo del shutdown en ws_tunnel, no el de acá.)
+    tcp_shutdown(up_fd, 2)
+    tcp_close(up_fd)
+    sse_release()
+    return 0
+}
+
 // Maneja una conexión WebSocket entrante (el gateway ya detectó el Upgrade).
 // Resuelve backend, abre conexión DEDICADA (sin pool — WS retiene el socket),
 // reenvía el handshake crudo preservando Upgrade/Connection/Sec-WebSocket-*,
 // relaya la respuesta (101) y tuneliza. Retorna cuando el túnel cierra.
-fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, host_name: String) {
+pub fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, host_name: String) {
     let res: Array = resolve_upstream_idx(host_name, path)
     let best_idx: int = res[0]
     let best_len: int = res[1]
@@ -834,7 +1142,16 @@ fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, host_
     return 0
 }
 
-fn proxy_dispatch(raw: Array) -> String {
+// Variante con el socket del cliente a la vista, que es lo que permite tunelizar
+// en vez de acumular. Convención del sink: ssl_handle > 0 ⇒ TLS; ssl_handle == 0
+// y client_fd >= 0 ⇒ plano; ninguno de los dos ⇒ sin sink, y entonces el camino
+// es exactamente el de siempre.
+// A diferencia del upgrade WebSocket —que se detecta en el REQUEST, antes de
+// tocar el upstream— un canal SSE solo se reconoce en la RESPUESTA, así que la
+// decisión se toma después de leer las cabeceras del upstream.
+// Devuelve "" cuando ya no queda nada que escribirle al cliente (túnel hecho, o
+// cliente ido): los dos workers del gateway ya chequean eso antes de escribir.
+pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     let method: String = raw[1]
     let path: String = raw[2]
     let headers: Array = raw[3]
@@ -969,9 +1286,48 @@ fn proxy_dispatch(raw: Array) -> String {
     // Select backend (round-robin) and forward with pooled connection
     let cfg: ProxyConfig = g_upstream_configs[best_idx]
     let backend: Backend = select_backend(cfg)
+    var tunnel_ok: int = 0
+    if ssl_handle > 0 or client_fd >= 0 {
+        tunnel_ok = 1
+    }
     let t0: int = time_epoch()
-    let resp: String = forward_pooled(best_idx, method, forward_path, headers, body, backend)
+    let fr: Array = forward_pooled_c(best_idx, method, forward_path, headers, body, backend, tunnel_ok)
+    let resp: String = fr[0]
+    let sse_fd: int = fr[1]
     let t1: int = time_epoch()
+
+    // ── Canal SSE: se tuneliza acá y no se vuelve ────────────────────────────
+    if sse_fd >= 0 {
+        // (1) El claim de single-flight se libera ANTES de bloquear. Un stream
+        // puede durar horas, y con el claim tomado TODO otro GET al mismo path
+        // se comería el plazo de espera y después re-claimearía.
+        if sf_claimed == 1 {
+            singleflight_release(host_name, path)
+        }
+        // (2) NO se llama cache_try_store: `resp` es solo la cabecera, sin
+        // cuerpo y sin longitud. Guardarla envenenaría el cache con una entrada
+        // que en el próximo HIT le llega al cliente como un stream vacío que no
+        // termina nunca. (Hoy el `Cache-Control: no-cache` de std/serve la haría
+        // rechazar igual, pero eso es suerte: un upstream SSE que no lo mande
+        // pasaría derecho.)
+        // (3) Log y métrica al ABRIR, con el mismo par t0/t1 que todo el resto:
+        // es la latencia hasta la cabecera, la misma semántica que para
+        // cualquier pedido. Registrarlas al CERRAR metería una muestra de horas
+        // en el histograma y destruiría el p99 de ese vhost para siempre.
+        if sse_open_count() >= g_sse_max_tunnels {
+            pool_discard(sse_fd)
+            access_log(method, path, 503, t1 - t0)
+            metrics_record_request(host_name, 503, t1 - t_start, 0)
+            return http_response(503, "Service Unavailable: too many SSE tunnels")
+        }
+        access_log(method, path, 200, t1 - t0)
+        metrics_record_request(host_name, 200, t1 - t_start, 0)
+        if sse_tunnel(ssl_handle, client_fd, sse_fd, resp) == 1 {
+            // Perdió la carrera por el cupo contra otro worker.
+            return http_response(503, "Service Unavailable: too many SSE tunnels")
+        }
+        return ""
+    }
 
     // Parse status code from response for logging
     var log_status: int = 0
@@ -997,4 +1353,11 @@ fn proxy_dispatch(raw: Array) -> String {
     metrics_record_request(host_name, log_status, t1 - t_start, 0)
 
     return resp
+}
+
+// Nombre viejo: sin sink, o sea sin túnel. Es el contrato que usan
+// examples/standalone.nx y cualquier consumer que arme la respuesta entera antes
+// de escribirla.
+pub fn proxy_dispatch(raw: Array) -> String {
+    return proxy_dispatch_c(raw, 0, -1)
 }

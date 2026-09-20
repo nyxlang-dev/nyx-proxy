@@ -57,9 +57,16 @@ fn http_worker() -> int {
                 if rl_resp.length() > 0 {
                     tcp_write(client, rl_resp)
                 } else {
-                    let response: String = proxy_dispatch(request)
+                    // proxy_dispatch_c con el fd del cliente: si el upstream
+                    // responde un canal SSE, el router lo tuneliza en vivo en vez
+                    // de juntarlo, y devuelve "" porque ya no queda nada que
+                    // escribir acá. Un "" también significa que la conexión se
+                    // terminó, así que no se sigue el keep-alive.
+                    let response: String = proxy_dispatch_c(request, 0, client)
                     if response.length() > 0 {
                         tcp_write(client, response)
+                    } else {
+                        keep_alive = false
                     }
                 }
                 let conn: String = http_find_header(headers, "Connection")

@@ -172,12 +172,20 @@ fn tls_worker() -> int {
                             keep_alive = false
                         } else {
                             let request: Array = ["request", method, path, fwd_headers, body]
-                            let response: String = proxy_dispatch(request)
+                            // Con el ssl_handle a la vista, una respuesta
+                            // text/event-stream se tuneliza en vivo en vez de
+                            // juntarse hasta que el upstream cierre. Devuelve ""
+                            // cuando ya no queda nada que escribir: el túnel
+                            // terminó, o el cliente se fue. El tls_close_conn de
+                            // más abajo sigue siendo el dueño del socket.
+                            let response: String = proxy_dispatch_c(request, ssl_handle, -1)
                             if response.length() > 0 {
                                 tls_write_conn(ssl_handle, response)
-                            }
-                            let conn: String = http_find_header(headers, "Connection")
-                            if conn == "close" {
+                                let conn: String = http_find_header(headers, "Connection")
+                                if conn == "close" {
+                                    keep_alive = false
+                                }
+                            } else {
                                 keep_alive = false
                             }
                         }

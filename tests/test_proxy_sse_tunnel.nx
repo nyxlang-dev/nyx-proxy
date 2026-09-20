@@ -7,12 +7,14 @@
 // acumulaba con un plazo de INACTIVIDAD de 30 s y un tope de 16 MiB. Pero el
 // heartbeat de `std/serve` (`:\n\n` cada 15 s) renueva ese plazo para siempre,
 // así que el gateway juntaba en silencio y el navegador no recibía NADA hasta
-// que el upstream cerrara.
+// que el upstream cerrara. Medido antes del arreglo: la respuesta volvía a los
+// 3016 ms (justo al cerrar el upstream), y con los valores de producción no
+// volvía nunca.
 //
 // Cada caso levanta un upstream falso en un puerto local fijo FUERA del rango
 // efímero (19381+). Un test que se cuelga muere por el `timeout 60` del runner:
-// eso es una herramienta, no un accidente — si el túnel no entregara nada, el
-// caso de abajo se cuelga en vez de pasar por casualidad.
+// eso es una herramienta, no un accidente — si el túnel no entregara nada, los
+// casos de abajo se cuelgan en vez de pasar por casualidad.
 //
 // Correr con NYX_PROJECT_DIR=<stack> (router.nx importa "src/...").
 
@@ -25,6 +27,11 @@ import "src/logger"
 import "src/ratelimit"
 
 var g_srvs: Array = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+// Tiempos que registran los lectores del lado cliente (ms desde el arranque).
+var g_t_uno: Array = [0]
+var g_t_dos: Array = [0]
+// 1 cuando el upstream falso vio que su socket se cerró.
+var g_up_vio_cierre: Array = [0]
 
 // Cabecera EXACTA que emite `std/serve` para un canal SSE: cero o más cabeceras
 // del pipeline (acá X-Request-Id, para verificar que se relayen), y después las
@@ -43,10 +50,8 @@ fn sse_head() -> String {
 // Lee un pedido sin cuerpo (request line + headers hasta la línea vacía).
 fn drain_request(c: int) {
     var fin: int = 0
-    var n: int = 0
     while fin == 0 {
         let line: String = tcp_read_line(c)
-        n = n + 1
         if line.length() == 0 {
             fin = 1
         }
@@ -58,56 +63,390 @@ fn get_headers() -> Array {
     return h
 }
 
-// ── RED: hoy el SSE se acumula y no llega nada hasta que el upstream cierra ───
-//
-// El upstream manda la cabecera y un evento EN SEGUIDA, y después late cada
-// 200 ms durante ~3 s antes de cerrar. Con el plazo de inactividad en 1 s, el
-// heartbeat lo renueva indefinidamente: exactamente lo que hace el heartbeat de
-// 15 s de `std/serve` contra el plazo de 30 s de producción, pero en miniatura
-// para que el caso termine.
-//
-// Con el túnel, la cabecera vuelve de inmediato (< 1 s) y el cuerpo se relaya
-// mientras el stream sigue vivo. Sin el túnel, `forward_pooled` no retorna hasta
-// que el upstream cierra, ~3 s después, y devuelve todo junto.
+// Par de sockets locales: [extremo del navegador, extremo que recibe el túnel].
+fn make_pair(port: int) -> Array {
+    let srv: int = tcp_listen("127.0.0.1", port)
+    let cli: int = tcp_connect("127.0.0.1", port)
+    let sv: int = tcp_accept(srv)
+    tcp_close(srv)
+    let r: Array = [cli, sv]
+    return r
+}
+
+// ── Caso 1: se detecta y NO se lee el cuerpo ──────────────────────────────────
+// El upstream manda cabecera + un evento y recién cierra 800 ms después. Antes
+// del túnel, forward_pooled no volvía hasta ese cierre.
+
+fn up_sse_uno() -> int {
+    let c: int = tcp_accept(g_srvs[0])
+    drain_request(c)
+    tcp_write(c, sse_head())
+    tcp_write(c, "data: uno\n\n")
+    sleep(800)
+    tcp_close(c)
+    return 0
+}
+
+fn test_detecta_y_no_lee_el_cuerpo() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19381)
+    g_srvs[0] = srv
+    let tid: int = thread_spawn(up_sse_uno)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19381 }
+    let t0: int = monotonic_ms()
+    let fr: Array = forward_pooled_c(3, "GET", "/sse", get_headers(), "", b, 1)
+    let dt: int = monotonic_ms() - t0
+    let head: String = fr[0]
+    let sse_fd: int = fr[1]
+    assert(sse_fd >= 0, "una respuesta text/event-stream se marca para tunelizar")
+    assert(dt < 500, "la cabecera vuelve ANTES de que el upstream cierre (no se acumula)")
+    assert(head.indexOf("text/event-stream") >= 0, "el Content-Type se relaya")
+    assert(head.indexOf("X-Request-Id: abc123") >= 0, "las cabeceras del pipeline se relayan")
+    assert(head.indexOf("X-Accel-Buffering: no") >= 0, "X-Accel-Buffering se relaya")
+    assert(head.indexOf("Content-Length") < 0, "no se inventa un Content-Length que no existe")
+    assert(head.indexOf("keep-alive") < 0, "no se promete keep-alive sobre un cuerpo sin fin conocido")
+    assert(head.indexOf("Connection: close") >= 0, "se encuadra con Connection: close")
+    assert(pool_len(3) == 0, "el fd de un stream NUNCA vuelve al pool")
+    tcp_close(sse_fd)
+    thread_join(tid)
+    tcp_close(srv)
+    print("PASS: un canal SSE se detecta por Content-Type y su cuerpo no se acumula")
+}
+
+// ── Caso 2: relay en orden y SIN buffering ────────────────────────────────────
+// El upstream manda «uno», espera 500 ms, manda «dos», espera y cierra. Si el
+// proxy bufferizara, los dos eventos llegarían juntos al final; lo que se
+// verifica es que la PAUSA del upstream se reproduzca en el cliente.
+
+fn up_sse_dos() -> int {
+    let c: int = tcp_accept(g_srvs[1])
+    drain_request(c)
+    tcp_write(c, sse_head())
+    tcp_write(c, "data: uno\n\n")
+    sleep(500)
+    tcp_write(c, "data: dos\n\n")
+    sleep(200)
+    tcp_write(c, ": cierre\n\n")
+    tcp_close(c)
+    return 0
+}
+
+fn test_relay_en_orden_y_sin_buffering() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19382)
+    g_srvs[1] = srv
+    let tid: int = thread_spawn(up_sse_dos)
+    let par: Array = make_pair(19392)
+    let cli: int = par[0]
+    let sv: int = par[1]
+    let b: Backend = Backend { host: "127.0.0.1", port: 19382 }
+    let fr: Array = forward_pooled_c(4, "GET", "/sse", get_headers(), "", b, 1)
+    let sse_fd: int = fr[1]
+    assert(sse_fd >= 0, "el canal se marca para tunelizar")
+
+    g_t_uno[0] = 0
+    g_t_dos[0] = 0
+    let t0: int = monotonic_ms()
+    // Lector del lado navegador: marca CUÁNDO vio cada evento.
+    fn lector() -> int {
+        var visto: String = ""
+        var fin: int = 0
+        while fin == 0 {
+            let s: String = tcp_read_partial(cli, 4096)
+            if s.length() == 0 {
+                fin = 1
+            } else {
+                visto = visto + s
+                if g_t_uno[0] == 0 and visto.indexOf("data: uno") >= 0 {
+                    g_t_uno[0] = monotonic_ms() - t0
+                }
+                if g_t_dos[0] == 0 and visto.indexOf("data: dos") >= 0 {
+                    g_t_dos[0] = monotonic_ms() - t0
+                    fin = 1
+                }
+            }
+        }
+        return 0
+    }
+    let lid: int = thread_spawn(lector)
+    sse_tunnel(0, sv, sse_fd, fr[0])
+    thread_join(lid)
+    thread_join(tid)
+    tcp_close(cli)
+    tcp_close(sv)
+    tcp_close(srv)
+
+    print("  uno a los " + int_to_string(g_t_uno[0]) + " ms, dos a los " + int_to_string(g_t_dos[0]) + " ms")
+    assert(g_t_uno[0] > 0, "el primer evento llega al cliente")
+    assert(g_t_dos[0] > 0, "el segundo evento llega al cliente")
+    assert(g_t_uno[0] < g_t_dos[0], "los eventos llegan EN ORDEN")
+    assert(g_t_uno[0] < 400, "el primero llega antes de que el upstream escriba el segundo")
+    assert(g_t_dos[0] - g_t_uno[0] > 300, "la pausa del upstream se PRESERVA: no se juntaron al final")
+    print("PASS: los eventos se relayan en orden y sin buffering")
+}
+
+// ── Caso 3: el cliente se va ⇒ se cierra el upstream y no vuelve al pool ──────
 
 fn up_sse_late() -> int {
-    let srv: int = g_srvs[0]
-    let c: int = tcp_accept(srv)
+    let c: int = tcp_accept(g_srvs[2])
     drain_request(c)
     tcp_write(c, sse_head())
     tcp_write(c, "data: uno\n\n")
     var i: int = 0
-    while i < 15 {
+    var fin: int = 0
+    while fin == 0 {
         sleep(200)
-        tcp_write(c, ":\n\n")
+        let n: int = tcp_write(c, ":\n\n")
+        if n <= 0 {
+            g_up_vio_cierre[0] = 1
+            fin = 1
+        }
         i = i + 1
+        if i > 40 {
+            fin = 1
+        }
     }
     tcp_close(c)
     return 0
 }
 
-fn test_red_sse_no_se_acumula() {
+fn test_cliente_se_va_cierra_el_upstream() {
     pool_init()
-    upstream_set_close_timeout(1)
-    let srv: int = tcp_listen("127.0.0.1", 19381)
-    g_srvs[0] = srv
+    g_up_vio_cierre[0] = 0
+    let srv: int = tcp_listen("127.0.0.1", 19383)
+    g_srvs[2] = srv
     let tid: int = thread_spawn(up_sse_late)
-    let b: Backend = Backend { host: "127.0.0.1", port: 19381 }
+    let par: Array = make_pair(19393)
+    let cli: int = par[0]
+    let sv: int = par[1]
+    let b: Backend = Backend { host: "127.0.0.1", port: 19383 }
+    let fr: Array = forward_pooled_c(5, "GET", "/sse", get_headers(), "", b, 1)
+    let sse_fd: int = fr[1]
+    assert(sse_fd >= 0, "el canal se marca para tunelizar")
+
+    // El navegador lee el primer evento y cierra la pestaña.
+    fn lector_corta() -> int {
+        var visto: String = ""
+        var fin: int = 0
+        while fin == 0 {
+            let s: String = tcp_read_partial(cli, 4096)
+            if s.length() == 0 {
+                fin = 1
+            } else {
+                visto = visto + s
+                if visto.indexOf("data: uno") >= 0 {
+                    fin = 1
+                }
+            }
+        }
+        tcp_close(cli)
+        return 0
+    }
+    let lid: int = thread_spawn(lector_corta)
     let t0: int = monotonic_ms()
-    let r1: String = forward_pooled(3, "GET", "/sse", get_headers(), "", b)
+    sse_tunnel(0, sv, sse_fd, fr[0])
     let dt: int = monotonic_ms() - t0
+    thread_join(lid)
+    thread_join(tid)
+    tcp_close(sv)
+    tcp_close(srv)
+
+    print("  el túnel se enteró del cierre en " + int_to_string(dt) + " ms")
+    assert(dt < 8000, "el cierre del cliente se detecta en segundos, no en el plazo del upstream")
+    assert(g_up_vio_cierre[0] == 1, "el upstream ve cerrado su socket: deja de latir contra un muerto")
+    assert(pool_len(5) == 0, "el fd del stream no vuelve al pool")
+    print("PASS: si el cliente se va, el upstream se cierra y el fd no vuelve al pool")
+}
+
+// ── Caso 4: el pedido siguiente por el mismo pool recibe SU respuesta ─────────
+// Un solo listener y DOS conexiones: que el segundo accept ocurra ya demuestra
+// que el fd del túnel no volvió al pool (si hubiera vuelto, pool_get lo reusaría,
+// el falso nunca aceptaría y el runner mataría la suite por timeout).
+
+fn up_sse_y_despues_normal() -> int {
+    let c1: int = tcp_accept(g_srvs[3])
+    drain_request(c1)
+    tcp_write(c1, sse_head())
+    tcp_write(c1, "data: uno\n\n")
+    sleep(300)
+    tcp_close(c1)
+    let c2: int = tcp_accept(g_srvs[3])
+    drain_request(c2)
+    tcp_write(c2, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsegundo")
+    tcp_close(c2)
+    return 0
+}
+
+fn test_siguiente_pedido_por_el_mismo_pool() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19384)
+    g_srvs[3] = srv
+    let tid: int = thread_spawn(up_sse_y_despues_normal)
+    let par: Array = make_pair(19394)
+    let cli: int = par[0]
+    let sv: int = par[1]
+    let b: Backend = Backend { host: "127.0.0.1", port: 19384 }
+    let fr: Array = forward_pooled_c(6, "GET", "/sse", get_headers(), "", b, 1)
+    let sse_fd: int = fr[1]
+    assert(sse_fd >= 0, "el canal se marca para tunelizar")
+    sse_tunnel(0, sv, sse_fd, fr[0])
+    tcp_close(cli)
+    tcp_close(sv)
+
+    let r2: String = forward_pooled(6, "GET", "/normal", get_headers(), "", b)
     thread_join(tid)
     tcp_close(srv)
-    upstream_set_close_timeout(30)
-    print("  tiempo hasta la respuesta: " + int_to_string(dt) + " ms (el upstream cierra a los ~3000)")
-    assert(dt < 1000, "la respuesta SSE vuelve mientras el stream sigue abierto, no al cerrar")
-    assert(r1.indexOf("text/event-stream") >= 0, "la cabecera del upstream se relaya")
-    assert(pool_len(3) == 0, "un fd de un stream NUNCA vuelve al pool")
-    print("PASS: una respuesta SSE no se acumula hasta el cierre")
+    assert(r2.indexOf("segundo") >= 0, "el pedido siguiente recibe SU respuesta")
+    assert(r2.indexOf("data:") < 0, "no recibe restos del stream anterior")
+    print("PASS: el pedido siguiente por el mismo pool recibe su propia respuesta")
+}
+
+// ── Caso 5: una respuesta sin longitud que NO es SSE no cambia (no regresión) ──
+
+fn up_sin_largo_no_sse() -> int {
+    let c: int = tcp_accept(g_srvs[4])
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\ncuerpo-sin-largo")
+    tcp_close(c)
+    return 0
+}
+
+fn test_sin_largo_que_no_es_sse_no_cambia() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19385)
+    g_srvs[4] = srv
+    let tid: int = thread_spawn(up_sin_largo_no_sse)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19385 }
+    // tunnel_ok ENCENDIDO: aun así no se tuneliza, porque no es text/event-stream.
+    let fr: Array = forward_pooled_c(7, "GET", "/a", get_headers(), "", b, 1)
+    thread_join(tid)
+    tcp_close(srv)
+    let resp: String = fr[0]
+    assert(fr[1] == -1, "una respuesta sin longitud que no es SSE no se tuneliza")
+    assert(resp.indexOf("Content-Length: 16") >= 0, "se sigue reemitiendo con Content-Length recalculado")
+    assert(resp.endsWith("cuerpo-sin-largo"), "el cuerpo se entrega entero")
+    assert(pool_len(7) == 0, "y el fd se descarta, como antes")
+    print("PASS: una respuesta sin longitud que no es SSE se comporta como siempre")
+}
+
+// ── Caso 6: el matching del Content-Type ─────────────────────────────────────
+
+fn up_ct_mayus() -> int {
+    let c: int = tcp_accept(g_srvs[5])
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Type: TEXT/EVENT-STREAM; charset=utf-8\r\n\r\ndata: x\n\n")
+    sleep(200)
+    tcp_close(c)
+    return 0
+}
+
+fn up_ct_parecido() -> int {
+    let c: int = tcp_accept(g_srvs[6])
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-streamx\r\n\r\nno-soy-sse")
+    tcp_close(c)
+    return 0
+}
+
+fn test_content_type_matching() {
+    pool_init()
+    let s1: int = tcp_listen("127.0.0.1", 19386)
+    g_srvs[5] = s1
+    let t1: int = thread_spawn(up_ct_mayus)
+    let b1: Backend = Backend { host: "127.0.0.1", port: 19386 }
+    let f1: Array = forward_pooled_c(8, "GET", "/a", get_headers(), "", b1, 1)
+    let fd1: int = f1[1]
+    assert(fd1 >= 0, "el Content-Type se compara sin mayúsculas y con parámetros")
+    tcp_close(fd1)
+    thread_join(t1)
+    tcp_close(s1)
+
+    let s2: int = tcp_listen("127.0.0.1", 19387)
+    g_srvs[6] = s2
+    let t2: int = thread_spawn(up_ct_parecido)
+    let b2: Backend = Backend { host: "127.0.0.1", port: 19387 }
+    let f2: Array = forward_pooled_c(9, "GET", "/a", get_headers(), "", b2, 1)
+    thread_join(t2)
+    tcp_close(s2)
+    assert(f2[1] == -1, "text/event-streamx NO es text/event-stream: el prefijo no alcanza")
+    print("PASS: el Content-Type se matchea por tipo exacto, sin mayúsculas y sin parámetros")
+}
+
+// ── Caso 7: un SSE CON Content-Length no se tuneliza (alcance acotado) ────────
+// Si el upstream encuadró la respuesta, el encuadre alcanza y el fd sigue siendo
+// reusable. `std/serve` nunca manda longitud en un canal SSE.
+
+fn up_sse_con_largo() -> int {
+    let c: int = tcp_accept(g_srvs[7])
+    drain_request(c)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 5\r\n\r\nhola!")
+    sleep(300)
+    tcp_close(c)
+    return 0
+}
+
+fn test_sse_con_content_length_no_se_tuneliza() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19388)
+    g_srvs[7] = srv
+    let tid: int = thread_spawn(up_sse_con_largo)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19388 }
+    let fr: Array = forward_pooled_c(10, "GET", "/a", get_headers(), "", b, 1)
+    assert(fr[1] == -1, "con Content-Length el encuadre alcanza: no se tuneliza")
+    let resp: String = fr[0]
+    assert(resp.endsWith("hola!"), "el cuerpo se entrega")
+    assert(pool_len(10) == 1, "y el fd vuelve al pool, porque su fin era conocido")
+    thread_join(tid)
+    tcp_close(srv)
+    print("PASS: un SSE con Content-Length se sirve encuadrado y el fd sigue reusable")
+}
+
+// ── Caso 8: el tope de túneles simultáneos ───────────────────────────────────
+
+fn up_sse_tope() -> int {
+    let c: int = tcp_accept(g_srvs[8])
+    drain_request(c)
+    tcp_write(c, sse_head())
+    tcp_write(c, "data: uno\n\n")
+    sleep(400)
+    tcp_close(c)
+    return 0
+}
+
+fn test_cupo() {
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19389)
+    g_srvs[8] = srv
+    let tid: int = thread_spawn(up_sse_tope)
+    let par: Array = make_pair(19396)
+    let cli: int = par[0]
+    let sv: int = par[1]
+    let b: Backend = Backend { host: "127.0.0.1", port: 19389 }
+    let fr: Array = forward_pooled_c(11, "GET", "/sse", get_headers(), "", b, 1)
+    let sse_fd: int = fr[1]
+    assert(sse_fd >= 0, "el canal se marca para tunelizar")
+    sse_set_max_tunnels(0)
+    let rc: int = sse_tunnel(0, sv, sse_fd, fr[0])
+    sse_set_max_tunnels(1024)
+    assert(rc == 1, "sin cupo el túnel se RECHAZA, para que el caller mande un 503")
+    assert(sse_open_count() == 0, "un rechazo no deja el contador de túneles inflado")
+    assert(pool_len(11) == 0, "y el fd del upstream se descarta, no vuelve al pool")
+    tcp_close(cli)
+    tcp_close(sv)
+    thread_join(tid)
+    tcp_close(srv)
+    print("PASS: sin cupo el túnel se rechaza sin relayar la cabecera")
 }
 
 fn main() -> int {
-    test_red_sse_no_se_acumula()
+    test_detecta_y_no_lee_el_cuerpo()
+    test_relay_en_orden_y_sin_buffering()
+    test_cliente_se_va_cierra_el_upstream()
+    test_siguiente_pedido_por_el_mismo_pool()
+    test_sin_largo_que_no_es_sse_no_cambia()
+    test_content_type_matching()
+    test_sse_con_content_length_no_se_tuneliza()
+    test_cupo()
     print("")
     print("ALL nyx-proxy SSE tunnel tests passed")
     return 0
