@@ -3,6 +3,39 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.5 — 2026-09-20
+
+**La latencia del proxy se medía en segundos y se reportaba como microsegundos:
+todas las métricas de latencia eran ruido.** [arco: sse-tunnel]
+
+- `src/router.nx` — **fix (observabilidad)**: `access_log` y
+  `metrics_record_request` reciben `latency_us` y dividen entre 1000, pero
+  `proxy_dispatch` medía sus cinco relojes con `time_epoch()`, que devuelve
+  SEGUNDOS. Una petición de 300 ms entraba como `0`, y hacía falta que una
+  tardara 1000 s para registrar 1 ms. En la práctica: **el access log escribía
+  `0ms` en todas sus líneas y el histograma `nyx_proxy_upstream_latency_ms`
+  metía todas las muestras en el primer bucket (`le="1"`)**, así que el p99 por
+  vhost no significaba nada. Medido con un upstream que tarda 60 ms: antes `0`,
+  ahora `62`.
+- El reloj pasa además a ser **monotónico** (`monotonic_us`), no el de pared. Una
+  duración medida con `time_epoch()` da negativa si NTP salta hacia atrás a
+  mitad de la petición. Es el mismo motivo por el que `metrics_init` ya usaba el
+  reloj monotónico para el uptime.
+- Es el **tercer bug de la misma familia de escalas** tras `0502bec` (la ventana
+  del rate limiter y el timestamp del access log) y `1c2bc18` (el gauge de
+  uptime). Sobrevivió a los dos arreglos anteriores porque las suites miraban el
+  FORMATO de la latencia y nunca su VALOR: `test_proxy_metrics` llamaba a
+  `metrics_record_request` directamente con microsegundos correctos, así que la
+  función siempre estuvo bien — quien mentía era el caller.
+- Guarda nueva en `tests/test_proxy_time.nx`, que es la suite de regresión de
+  esta familia: levanta un upstream que tarda 60 ms, hace pasar una petición por
+  `proxy_dispatch` y **mide el número** que queda en `/metrics`. RED verificado
+  revirtiendo los cinco relojes: `latencia registrada: 0 ms`.
+- Sin cambios de comportamiento fuera de la observabilidad: `access_log` y
+  `metrics_record_request` no se tocaron, y los `time_epoch()` que miden en
+  segundos a propósito —la ventana del rate limiter y el timestamp del access
+  log— siguen como estaban.
+
 ## v0.4.4 — 2026-09-20
 
 **Una respuesta `text/event-stream` ahora se transmite en vivo en vez de juntarse

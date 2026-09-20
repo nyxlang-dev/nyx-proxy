@@ -45,6 +45,84 @@ fn primer_campo(linea: String) -> String {
     return linea.substring(0, esp)
 }
 
+var g_srv_lat: Array = [0]
+
+// Upstream que tarda ~60 ms en responder. El número importa: por debajo de
+// 1000 ms, el bug que este caso caza registraba CERO.
+fn up_lento() -> int {
+    let c: int = tcp_accept(g_srv_lat[0])
+    var fin: int = 0
+    while fin == 0 {
+        let line: String = tcp_read_line(c)
+        if line.length() == 0 { fin = 1 }
+    }
+    sleep(60)
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    tcp_close(c)
+    return 0
+}
+
+// Extrae una métrica CON label de host: `nombre{host="h"} 42` -> 42.
+fn valor_metrica_host(salida: String, nombre: String, host: String) -> int {
+    let marca: String = "\n" + nombre + "{host=\"" + host + "\"} "
+    let pos: int = salida.indexOf(marca)
+    if pos < 0 { return -1 }
+    let desde: int = pos + marca.length()
+    var fin: int = desde
+    while fin < salida.length() {
+        let c: String = salida.substring(fin, fin + 1)
+        if c == "\n" { break }
+        fin = fin + 1
+    }
+    return string_to_int(salida.substring(desde, fin))
+}
+
+// ── Tercer bug de la misma familia: la LATENCIA se medía en segundos ─────────
+// `access_log` y `metrics_record_request` reciben `latency_us` y dividen entre
+// 1000, pero `proxy_dispatch` medía con `time_epoch()`, que da SEGUNDOS. Una
+// petición de 300 ms entraba como 0: el access log escribía «0ms» en todas sus
+// líneas y el histograma metía TODO en el primer bucket. Sobrevivió a los dos
+// arreglos anteriores de esta familia porque ninguna suite miraba el VALOR de la
+// latencia, solo su formato — por eso este caso mide un número, no un texto.
+fn test_latencia_real_no_se_registra_como_cero() {
+    let puerto: int = 19371
+    let srv: int = tcp_listen("127.0.0.1", puerto)
+    g_srv_lat[0] = srv
+    let tid: int = thread_spawn(up_lento)
+
+    let ruta: String = "/tmp/nyx_proxy_test_latencia.toml"
+    var cfg: String = "[server]\nlisten = 18080\n\n[upstream.0]\n"
+    cfg = cfg + "name = \"lento\"\n"
+    cfg = cfg + "host = \"127.0.0.1\"\n"
+    cfg = cfg + "port = " + int_to_string(puerto) + "\n"
+    write_file(ruta, cfg)
+    load_config(ruta)
+    metrics_init()
+    pool_init()
+
+    let headers: Array = ["Host", "lat.test"]
+    let req: Array = ["request", "GET", "/", headers, ""]
+    let resp: String = proxy_dispatch(req)
+    thread_join(tid)
+    tcp_close(srv)
+    remove_file(ruta)
+
+    assert(resp.indexOf("200") >= 0, "la petición llega al upstream y vuelve")
+
+    let out: String = metrics_render()
+    let suma: int = valor_metrica_host(out, "nyx_proxy_upstream_latency_ms_sum", "lat.test")
+    let cuenta: int = valor_metrica_host(out, "nyx_proxy_upstream_latency_ms_count", "lat.test")
+    print("  latencia registrada: " + int_to_string(suma) + " ms (el upstream tardó ~60)")
+
+    assert(cuenta == 1, "la petición se contabilizó")
+    // El corazón del caso: con el bug, `suma` era 0 y la muestra caía en le="1".
+    assert(suma >= 40, "una petición de ~60 ms NO se registra como 0 ms")
+    assert(suma < 5000, "y tampoco se registra inflada (microsegundos sin dividir)")
+    assert(out.indexOf("nyx_proxy_upstream_latency_ms_bucket{host=\"lat.test\",le=\"1\"} 0") >= 0,
+           "la muestra no cae en el primer bucket del histograma")
+    print("PASS router: la latencia se mide en microsegundos, no en segundos")
+}
+
 fn main() -> int {
     // Se inicializa acá para que el sleep de 1,1 s del rate limiter valga
     // también como uptime medible más abajo, sin dormir dos veces.
@@ -114,6 +192,9 @@ fn main() -> int {
     print("PASS logger: método, ruta, estado y latencia en milisegundos")
 
     remove_file(ruta)
+
+    test_latencia_real_no_se_registra_como_cero()
+
     print("test_proxy_time: OK")
     return 0
 }

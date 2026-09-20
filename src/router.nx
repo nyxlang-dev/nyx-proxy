@@ -1184,7 +1184,20 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
         return ""
     }
 
-    let t_start: int = time_epoch()
+    // MEDIDO EN MICROSEGUNDOS, y con reloj MONOTÓNICO. Las dos cosas importan:
+    //  · `access_log` y `metrics_record_request` reciben `latency_us` y dividen
+    //    entre 1000. Acá se medía con `time_epoch()`, que da SEGUNDOS, así que
+    //    una petición de 300 ms entraba como 0 y hacía falta que una tardara
+    //    1000 s para registrar 1 ms. En la práctica el access log escribía
+    //    «0ms» en todas sus líneas y el histograma de latencia metía TODO en el
+    //    primer bucket (le="1"): las métricas de latencia del proxy eran ruido.
+    //    Tercer bug de la misma familia de escalas tras 0502bec y 1c2bc18; los
+    //    dos anteriores se arreglaron y este sobrevivió porque ninguna suite
+    //    miraba el valor, solo el formato.
+    //  · una DURACIÓN no se mide con el reloj de pared: un salto de NTP hacia
+    //    atrás daba latencias negativas. Es el mismo motivo por el que
+    //    `metrics_init` ya usaba el reloj monotónico para el uptime.
+    let t_start: int = monotonic_us()
 
     // Initialize pools on first call
     pool_init()
@@ -1210,7 +1223,7 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
             let cached: String = cache_lookup(host_name, path)
             if cached.length() > 0 {
                 let resp_hit: String = cache_mark_hit(cached)
-                let t_hit: int = time_epoch()
+                let t_hit: int = monotonic_us()
                 access_log(method, path, 200, t_hit - t_start)
                 metrics_record_request(host_name, 200, t_hit - t_start, 1)
                 return resp_hit
@@ -1222,7 +1235,7 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
                 let sf_hit: String = singleflight_wait(host_name, path, 3000)
                 if sf_hit.length() > 0 {
                     let resp_sf: String = cache_mark_hit(sf_hit)
-                    let t_sf: int = time_epoch()
+                    let t_sf: int = monotonic_us()
                     access_log(method, path, 200, t_sf - t_start)
                     metrics_record_request(host_name, 200, t_sf - t_start, 1)
                     return resp_sf
@@ -1312,11 +1325,11 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     if ssl_handle > 0 or client_fd >= 0 {
         tunnel_ok = 1
     }
-    let t0: int = time_epoch()
+    let t0: int = monotonic_us()
     let fr: Array = forward_pooled_c(best_idx, method, forward_path, headers, body, backend, tunnel_ok)
     let resp: String = fr[0]
     let sse_fd: int = fr[1]
-    let t1: int = time_epoch()
+    let t1: int = monotonic_us()
 
     // ── Canal SSE: se tuneliza acá y no se vuelve ────────────────────────────
     if sse_fd >= 0 {
