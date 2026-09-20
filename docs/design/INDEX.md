@@ -38,6 +38,7 @@ el archivado.
 | Archivo | Fecha | Tipo | Estado | Nota | Referenciado por |
 |---|---|---|---|---|---|
 | `docs/design/briefs/_recibidos` | — | briefs | — | — | `AGENTS.md`, `docs/design/ROADMAP.md` |
+| `docs/design/plans/2026-09-20-sse-tunnel.md` | 2026-09-20 | plan | VIGENTE | GO Ottavio 2026-09-20, modo sdd | `docs/design/ROADMAP.md` |
 | `docs/design/specs/2026-09-20-sdd-proxy-design.md` | 2026-09-20 | spec | VIGENTE | GO Ottavio 2026-09-20 | `AGENTS.md`, `docs/design/ROADMAP.md` |
 <!-- index:end -->
 

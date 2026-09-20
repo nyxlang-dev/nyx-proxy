@@ -1,0 +1,114 @@
+// test_proxy_sse_tunnel.nx — una respuesta `Content-Type: text/event-stream` se
+// tuneliza en vivo hacia el cliente en vez de acumularse hasta que el upstream cierre.
+//
+// Qué arregla (encargo del repo del lenguaje, Task 6 del arco `serve-sse`):
+// `std/serve` emite SSE sin `Content-Length` y sin `chunked`, con el cuerpo
+// terminado por FIN TCP. El router lo trataba como «cuerpo hasta el cierre»:
+// acumulaba con un plazo de INACTIVIDAD de 30 s y un tope de 16 MiB. Pero el
+// heartbeat de `std/serve` (`:\n\n` cada 15 s) renueva ese plazo para siempre,
+// así que el gateway juntaba en silencio y el navegador no recibía NADA hasta
+// que el upstream cerrara.
+//
+// Cada caso levanta un upstream falso en un puerto local fijo FUERA del rango
+// efímero (19381+). Un test que se cuelga muere por el `timeout 60` del runner:
+// eso es una herramienta, no un accidente — si el túnel no entregara nada, el
+// caso de abajo se cuelga en vez de pasar por casualidad.
+//
+// Correr con NYX_PROJECT_DIR=<stack> (router.nx importa "src/...").
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+var g_srvs: Array = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+// Cabecera EXACTA que emite `std/serve` para un canal SSE: cero o más cabeceras
+// del pipeline (acá X-Request-Id, para verificar que se relayen), y después las
+// cuatro fijas. Sin `Content-Length` y sin `Transfer-Encoding`.
+fn sse_head() -> String {
+    var h: String = "HTTP/1.1 200 OK\r\n"
+    h = h + "X-Request-Id: abc123\r\n"
+    h = h + "Content-Type: text/event-stream; charset=utf-8\r\n"
+    h = h + "Cache-Control: no-cache\r\n"
+    h = h + "X-Accel-Buffering: no\r\n"
+    h = h + "Connection: close\r\n"
+    h = h + "\r\n"
+    return h
+}
+
+// Lee un pedido sin cuerpo (request line + headers hasta la línea vacía).
+fn drain_request(c: int) {
+    var fin: int = 0
+    var n: int = 0
+    while fin == 0 {
+        let line: String = tcp_read_line(c)
+        n = n + 1
+        if line.length() == 0 {
+            fin = 1
+        }
+    }
+}
+
+fn get_headers() -> Array {
+    let h: Array = ["Host", "test"]
+    return h
+}
+
+// ── RED: hoy el SSE se acumula y no llega nada hasta que el upstream cierra ───
+//
+// El upstream manda la cabecera y un evento EN SEGUIDA, y después late cada
+// 200 ms durante ~3 s antes de cerrar. Con el plazo de inactividad en 1 s, el
+// heartbeat lo renueva indefinidamente: exactamente lo que hace el heartbeat de
+// 15 s de `std/serve` contra el plazo de 30 s de producción, pero en miniatura
+// para que el caso termine.
+//
+// Con el túnel, la cabecera vuelve de inmediato (< 1 s) y el cuerpo se relaya
+// mientras el stream sigue vivo. Sin el túnel, `forward_pooled` no retorna hasta
+// que el upstream cierra, ~3 s después, y devuelve todo junto.
+
+fn up_sse_late() -> int {
+    let srv: int = g_srvs[0]
+    let c: int = tcp_accept(srv)
+    drain_request(c)
+    tcp_write(c, sse_head())
+    tcp_write(c, "data: uno\n\n")
+    var i: int = 0
+    while i < 15 {
+        sleep(200)
+        tcp_write(c, ":\n\n")
+        i = i + 1
+    }
+    tcp_close(c)
+    return 0
+}
+
+fn test_red_sse_no_se_acumula() {
+    pool_init()
+    upstream_set_close_timeout(1)
+    let srv: int = tcp_listen("127.0.0.1", 19381)
+    g_srvs[0] = srv
+    let tid: int = thread_spawn(up_sse_late)
+    let b: Backend = Backend { host: "127.0.0.1", port: 19381 }
+    let t0: int = monotonic_ms()
+    let r1: String = forward_pooled(3, "GET", "/sse", get_headers(), "", b)
+    let dt: int = monotonic_ms() - t0
+    thread_join(tid)
+    tcp_close(srv)
+    upstream_set_close_timeout(30)
+    print("  tiempo hasta la respuesta: " + int_to_string(dt) + " ms (el upstream cierra a los ~3000)")
+    assert(dt < 1000, "la respuesta SSE vuelve mientras el stream sigue abierto, no al cerrar")
+    assert(r1.indexOf("text/event-stream") >= 0, "la cabecera del upstream se relaya")
+    assert(pool_len(3) == 0, "un fd de un stream NUNCA vuelve al pool")
+    print("PASS: una respuesta SSE no se acumula hasta el cierre")
+}
+
+fn main() -> int {
+    test_red_sse_no_se_acumula()
+    print("")
+    print("ALL nyx-proxy SSE tunnel tests passed")
+    return 0
+}
