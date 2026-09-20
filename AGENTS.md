@@ -123,7 +123,14 @@ global de fds de listener, una fn-thread por caso que hace `tcp_accept`, drena e
 bytes crudos de respuesta. Puertos fijos fuera del rango efímero (19350+), uno por caso, y un
 índice de upstream distinto por caso para no compartir pool.
 
-Dos cosas que hay que saber:
+**El toolchain es compartido y eso puede corromper una corrida.** `run_unit_tests.sh` copia cada
+suite a `$NYX_HOME/script.nx`, que es un archivo ÚNICO en el repo del lenguaje. Si hay otra sesión
+compilando ahí —cosa que pasa— tu corrida puede terminar ejecutando el binario de otro test, sin
+ningún error que lo delate. Pasó en la sesión que escribió el túnel SSE: la primera corrida del RED
+devolvió la salida de un test ajeno. La salida: copiar `nyx_bootstrap`, `runtime/` y `std/` a un
+directorio propio y correr con `NYX_HOME=<ese directorio>`. Son ~16 MB y aísla por completo.
+
+Dos cosas más que hay que saber:
 
 - **La lista de suites está hardcodeada** en `scripts/run_unit_tests.sh`. Una suite nueva que no
   se agregue ahí no corre nunca; una que se borre sin sacarla de la lista falla explícito (por eso
