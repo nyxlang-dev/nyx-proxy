@@ -1,4 +1,4 @@
-> **ESTADO: VIGENTE** — GO Ottavio 2026-09-20, modo sdd
+> **ESTADO: COMPLETO** — cerrado 2026-09-20, cosecha en docs/archive/sdd/2026-09-20-sse-tunnel/
 
 # Túnel SSE: text/event-stream en vivo a través del proxy — Implementation Plan
 
