@@ -107,28 +107,6 @@ fn sse_init() {
     if g_sse_mtx_init == 1 {
         return 0
     }
-    // SIGPIPE: este runtime NO instala un SIG_IGN global — el MSG_NOSIGNAL de
-    // os_sock_send es «load-bearing», según dice su propio comentario. `tcp_write`
-    // queda cubierto por eso, pero OpenSSL escribe con write() crudo, así que un
-    // `tls_write_conn` contra un cliente que ya cerró MATA EL PROCESO ENTERO.
-    // En el camino normal la ventana es de milisegundos (la respuesta se escribe
-    // apenas se leyó el pedido) y por eso nunca se vio; en un túnel dura lo que
-    // dure el stream, así que un cliente que cierra la pestaña se lleva puesto el
-    // gateway con todos sus dominios. Ignorada la señal, el SSL_write devuelve
-    // -1/EPIPE, `tls_write_conn` devuelve -1 y el túnel corta limpio, que es
-    // justo lo que el loop ya sabe manejar.
-    // Medido: sin esta línea, el caso de tests/test_proxy_sse_tls.nx muere con
-    // rc=141 (128+SIGPIPE) sin alcanzar a imprimir una sola línea.
-    //
-    // ESTO ES TEMPORAL Y SE RETIRA. El core ya tiene el arreglo de verdad (un
-    // BIO propio cuyo bwrite va por os_sock_send, con MSG_NOSIGNAL), y entonces
-    // esta línea sobra — y encima es lo que el propio core decidió NO hacer: una
-    // biblioteca no puede cambiarle la política de señales al proceso que la
-    // importa. El orden para sacarla está en docs/design/ROADMAP.md §Deuda con
-    // orden de ejecución; el paso que lo autoriza es correr
-    // tests/test_proxy_sse_tls.nx SIN su signal_ignore, contra un toolchain que
-    // ya traiga el BIO. Antes de eso, sacarla reabre el agujero en producción.
-    signal_ignore(13)
     g_sse_mtx = mutex_new()
     g_sse_mtx_init = 1
     return 0

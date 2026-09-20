@@ -3,6 +3,14 @@
 // plano; acá se cubren los builtins del otro: tls_write_conn para relayar, y la
 // sonda de vida con tls_wait_readable + tls_read_nonblock.
 //
+// Este caso también es el control positivo del arreglo de SIGPIPE del core. Hasta
+// que existió, un SSL_write contra un peer cerrado mataba el proceso: este mismo
+// caso moría con rc=141 (128+13) sin alcanzar a imprimir una línea, y hubo que
+// mitigarlo con `signal_ignore(13)`. Desde que el runtime trae su BIO propio
+// —cuyo bwrite va por os_sock_send, con MSG_NOSIGNAL— la mitigación se retiró y
+// el caso pasa sin ella. Si algún día vuelve a morir con 141, la regresión es
+// del runtime, no de acá.
+//
 // Vive en su PROPIA suite porque `tls_server_init` publica un contexto TLS
 // global de proceso: mezclar un caso TLS con los demás obliga a que sea el
 // último y a que nadie más toque TLS, y eso es una regla que se olvida. Aparte,
@@ -73,13 +81,6 @@ fn up_sse_tls() -> int {
 }
 
 fn test_sse_sobre_tls() -> int {
-    // SIGPIPE: este runtime NO tiene un SIG_IGN global (os_posix.c lo dice
-    // explícito: el MSG_NOSIGNAL de os_sock_send es «load-bearing»), y OpenSSL
-    // escribe con write() crudo. Entonces un SSL_write contra un peer que ya
-    // cerró MATA el proceso. Sin esta línea, este caso muere con rc=141 sin
-    // llegar a imprimir nada. El router hace lo mismo en sse_init(), porque en
-    // un túnel la ventana para que el cliente cierre dura lo que dure el stream.
-    signal_ignore(13)
     let rc: int = exec_code("openssl req -x509 -newkey rsa:2048 -keyout /tmp/nyx_sse_key.pem -out /tmp/nyx_sse_cert.pem -days 1 -nodes -subj /CN=localhost >/dev/null 2>&1")
     if rc != 0 {
         print("SKIP: sin openssl, el sink TLS queda sin cubrir")

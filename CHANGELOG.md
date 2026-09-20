@@ -3,6 +3,30 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.6 — 2026-09-20
+
+**Se retira la mitigación de SIGPIPE: el arreglo de verdad ya está en el
+runtime.** [arco: sse-tunnel]
+
+- `src/router.nx` — fuera el `signal_ignore(13)` de `sse_init()`. Era una curita
+  puesta en v0.4.4, cuando un `tls_write_conn` contra un peer cerrado mataba el
+  proceso entero. El core ya trae el arreglo correcto: un `BIO_METHOD` propio
+  cuyo `bwrite` va por `os_sock_send` (con `MSG_NOSIGNAL`), en vez de un
+  `SIG_IGN` global. **Una biblioteca no puede cambiarle la política de señales al
+  proceso que la importa**, así que esa línea tenía que salir apenas hubiera
+  alternativa; el mismo argumento por el que el core NO hizo el `SIG_IGN`.
+- **Control positivo, que es lo que autoriza el retiro**: `tests/test_proxy_sse_tls.nx`
+  corrido SIN la mitigación del test NI la de la lib, contra un toolchain que ya
+  trae el BIO — tres corridas, las tres verdes (primer evento a 1 ms, la pausa de
+  500 ms del upstream preservada). Con el runtime anterior, ese mismo caso moría
+  con rc=141 (128+SIGPIPE) sin imprimir una línea. La única variable que cambió
+  es el runtime.
+- El caso TLS queda documentado como el control positivo permanente de ese
+  arreglo: si vuelve a morir con 141, la regresión es del runtime.
+- Requiere un toolchain con el BIO. Con uno anterior, un cliente TLS que corta a
+  mitad de un stream vuelve a matar el proceso — que es el estado que tenía
+  cualquier versión previa a v0.4.4.
+
 ## v0.4.5 — 2026-09-20
 
 **La latencia del proxy se medía en segundos y se reportaba como microsegundos:
