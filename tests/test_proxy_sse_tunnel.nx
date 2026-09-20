@@ -32,6 +32,11 @@ var g_t_uno: Array = [0]
 var g_t_dos: Array = [0]
 // 1 cuando el upstream falso vio que su socket se cerró.
 var g_up_vio_cierre: Array = [0]
+// Handshake con el thread lector: mide CUÁNDO llega cada evento, así que tiene
+// que estar bloqueado en su read ANTES de que el túnel escriba nada. Si no, en
+// una máquina cargada el lector arranca tarde, encuentra todo junto en el buffer
+// del socket y el test mide su propio retraso de arranque en vez del del proxy.
+var g_lector_listo: Array = [0]
 
 // Cabecera EXACTA que emite `std/serve` para un canal SSE: cero o más cabeceras
 // del pipeline (acá X-Request-Id, para verificar que se relayen), y después las
@@ -146,11 +151,12 @@ fn test_relay_en_orden_y_sin_buffering() {
 
     g_t_uno[0] = 0
     g_t_dos[0] = 0
-    let t0: int = monotonic_ms()
+    g_lector_listo[0] = 0
     // Lector del lado navegador: marca CUÁNDO vio cada evento.
     fn lector() -> int {
         var visto: String = ""
         var fin: int = 0
+        g_lector_listo[0] = 1
         while fin == 0 {
             let s: String = tcp_read_partial(cli, 4096)
             if s.length() == 0 {
@@ -158,10 +164,10 @@ fn test_relay_en_orden_y_sin_buffering() {
             } else {
                 visto = visto + s
                 if g_t_uno[0] == 0 and visto.indexOf("data: uno") >= 0 {
-                    g_t_uno[0] = monotonic_ms() - t0
+                    g_t_uno[0] = monotonic_ms()
                 }
                 if g_t_dos[0] == 0 and visto.indexOf("data: dos") >= 0 {
-                    g_t_dos[0] = monotonic_ms() - t0
+                    g_t_dos[0] = monotonic_ms()
                     fin = 1
                 }
             }
@@ -169,6 +175,10 @@ fn test_relay_en_orden_y_sin_buffering() {
         return 0
     }
     let lid: int = thread_spawn(lector)
+    while g_lector_listo[0] == 0 {
+        sleep(5)
+    }
+    let t0: int = monotonic_ms()
     sse_tunnel(0, sv, sse_fd, fr[0])
     thread_join(lid)
     thread_join(tid)
@@ -176,12 +186,16 @@ fn test_relay_en_orden_y_sin_buffering() {
     tcp_close(sv)
     tcp_close(srv)
 
-    print("  uno a los " + int_to_string(g_t_uno[0]) + " ms, dos a los " + int_to_string(g_t_dos[0]) + " ms")
+    let d_uno: int = g_t_uno[0] - t0
+    let d_sep: int = g_t_dos[0] - g_t_uno[0]
+    print("  primer evento a los " + int_to_string(d_uno) + " ms; separación entre eventos: " + int_to_string(d_sep) + " ms (el upstream pausa 500)")
     assert(g_t_uno[0] > 0, "el primer evento llega al cliente")
     assert(g_t_dos[0] > 0, "el segundo evento llega al cliente")
     assert(g_t_uno[0] < g_t_dos[0], "los eventos llegan EN ORDEN")
-    assert(g_t_uno[0] < 400, "el primero llega antes de que el upstream escriba el segundo")
-    assert(g_t_dos[0] - g_t_uno[0] > 300, "la pausa del upstream se PRESERVA: no se juntaron al final")
+    assert(d_uno < 400, "el primero llega antes de que el upstream escriba el segundo")
+    // LA aserción del caso: la pausa del upstream se reproduce en el cliente. Si
+    // el proxy bufferizara, los dos eventos saldrían juntos y esto sería ~0.
+    assert(d_sep > 300, "la pausa del upstream se PRESERVA: no se juntaron al final")
     print("PASS: los eventos se relayan en orden y sin buffering")
 }
 
@@ -228,6 +242,7 @@ fn test_cliente_se_va_cierra_el_upstream() {
     fn lector_corta() -> int {
         var visto: String = ""
         var fin: int = 0
+        g_lector_listo[0] = 1
         while fin == 0 {
             let s: String = tcp_read_partial(cli, 4096)
             if s.length() == 0 {
@@ -242,7 +257,11 @@ fn test_cliente_se_va_cierra_el_upstream() {
         tcp_close(cli)
         return 0
     }
+    g_lector_listo[0] = 0
     let lid: int = thread_spawn(lector_corta)
+    while g_lector_listo[0] == 0 {
+        sleep(5)
+    }
     let t0: int = monotonic_ms()
     sse_tunnel(0, sv, sse_fd, fr[0])
     let dt: int = monotonic_ms() - t0

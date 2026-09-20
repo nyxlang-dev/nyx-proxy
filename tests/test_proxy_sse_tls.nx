@@ -1,0 +1,161 @@
+// test_proxy_sse_tls.nx — el túnel SSE sobre TLS, que es el sink que corre en
+// producción. Los ocho casos de test_proxy_sse_tunnel.nx ejercitan el camino
+// plano; acá se cubren los builtins del otro: tls_write_conn para relayar, y la
+// sonda de vida con tls_wait_readable + tls_read_nonblock.
+//
+// Vive en su PROPIA suite porque `tls_server_init` publica un contexto TLS
+// global de proceso: mezclar un caso TLS con los demás obliga a que sea el
+// último y a que nadie más toque TLS, y eso es una regla que se olvida. Aparte,
+// un handshake que falla se come el presupuesto de 60 s del runner, así que
+// conviene que arrastre solo a su propia suite.
+//
+// Correr con NYX_PROJECT_DIR=<stack> (router.nx importa "src/...").
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+var g_srvs: Array = [0]
+var g_t_uno: Array = [0]
+var g_t_dos: Array = [0]
+
+fn sse_head() -> String {
+    var h: String = "HTTP/1.1 200 OK\r\n"
+    h = h + "Content-Type: text/event-stream; charset=utf-8\r\n"
+    h = h + "Cache-Control: no-cache\r\n"
+    h = h + "X-Accel-Buffering: no\r\n"
+    h = h + "Connection: close\r\n"
+    h = h + "\r\n"
+    return h
+}
+
+fn drain_request(c: int) {
+    var fin: int = 0
+    while fin == 0 {
+        let line: String = tcp_read_line(c)
+        if line.length() == 0 {
+            fin = 1
+        }
+    }
+}
+
+fn get_headers() -> Array {
+    let h: Array = ["Host", "test"]
+    return h
+}
+
+// ── Caso 9: el sink TLS, que es el que corre en producción ───────────────────
+// Los ocho casos de arriba ejercitan el sink plano. El gateway real escribe por
+// TLS, o sea otro par de builtins: tls_write_conn para relayar, y la sonda de
+// vida con tls_wait_readable + tls_read_nonblock (el read es OBLIGATORIO cuando
+// el wait da 1: sin él, un peer que ya mandó close_notify lo devuelve para
+// siempre y el túnel entra en busy-spin).
+//
+// Va ÚLTIMO y con SKIP limpio a propósito: tls_server_init publica un contexto
+// TLS global de proceso, así que no puede haber dos casos TLS en la misma suite,
+// y un handshake que falla se lleva puesto el presupuesto de 60 s del runner.
+
+fn up_sse_tls() -> int {
+    let c: int = tcp_accept(g_srvs[0])
+    drain_request(c)
+    tcp_write(c, sse_head())
+    tcp_write(c, "data: uno\n\n")
+    sleep(500)
+    tcp_write(c, "data: dos\n\n")
+    sleep(150)
+    tcp_write(c, ": cierre\n\n")
+    tcp_close(c)
+    return 0
+}
+
+fn test_sse_sobre_tls() -> int {
+    // SIGPIPE: este runtime NO tiene un SIG_IGN global (os_posix.c lo dice
+    // explícito: el MSG_NOSIGNAL de os_sock_send es «load-bearing»), y OpenSSL
+    // escribe con write() crudo. Entonces un SSL_write contra un peer que ya
+    // cerró MATA el proceso. Sin esta línea, este caso muere con rc=141 sin
+    // llegar a imprimir nada. El router hace lo mismo en sse_init(), porque en
+    // un túnel la ventana para que el cliente cierre dura lo que dure el stream.
+    signal_ignore(13)
+    let rc: int = exec_code("openssl req -x509 -newkey rsa:2048 -keyout /tmp/nyx_sse_key.pem -out /tmp/nyx_sse_cert.pem -days 1 -nodes -subj /CN=localhost >/dev/null 2>&1")
+    if rc != 0 {
+        print("SKIP: sin openssl, el sink TLS queda sin cubrir")
+        return 0
+    }
+    if tls_server_init("/tmp/nyx_sse_cert.pem", "/tmp/nyx_sse_key.pem") < 0 {
+        print("SKIP: tls_server_init falló, el sink TLS queda sin cubrir")
+        return 0
+    }
+    pool_init()
+    let srv: int = tcp_listen("127.0.0.1", 19390)
+    g_srvs[0] = srv
+    let tid: int = thread_spawn(up_sse_tls)
+    let tls_srv: int = tcp_listen("127.0.0.1", 19395)
+
+    // El "gateway": acepta TLS y tuneliza por el ssl_handle, igual que el worker
+    // de producción.
+    fn gw() -> int {
+        let cfd: int = tcp_accept(tls_srv)
+        let ssl: int = tls_accept(cfd)
+        if ssl == 0 {
+            tcp_close(cfd)
+            return 0
+        }
+        let b: Backend = Backend { host: "127.0.0.1", port: 19390 }
+        let fr: Array = forward_pooled_c(12, "GET", "/sse", get_headers(), "", b, 1)
+        sse_tunnel(ssl, -1, fr[1], fr[0])
+        tls_close_conn(ssl)
+        return 0
+    }
+    let gid: int = thread_spawn(gw)
+
+    let h: int = tls_connect("127.0.0.1", 19395)
+    assert(h != 0, "el cliente TLS conecta")
+    g_t_uno[0] = 0
+    g_t_dos[0] = 0
+    let t0: int = monotonic_ms()
+    var visto: String = ""
+    var fin: int = 0
+    while fin == 0 {
+        let s: String = tls_read_partial(h, 4096)
+        if s.length() == 0 {
+            fin = 1
+        } else {
+            visto = visto + s
+            if g_t_uno[0] == 0 and visto.indexOf("data: uno") >= 0 {
+                g_t_uno[0] = monotonic_ms()
+            }
+            if g_t_dos[0] == 0 and visto.indexOf("data: dos") >= 0 {
+                g_t_dos[0] = monotonic_ms()
+                fin = 1
+            }
+        }
+    }
+    tls_close_conn(h)
+    thread_join(gid)
+    thread_join(tid)
+    tcp_close(tls_srv)
+    tcp_close(srv)
+
+    let d_uno: int = g_t_uno[0] - t0
+    let d_sep: int = g_t_dos[0] - g_t_uno[0]
+    print("  sobre TLS: primer evento a los " + int_to_string(d_uno) + " ms; separación entre eventos: " + int_to_string(d_sep) + " ms (el upstream pausa 500)")
+    assert(visto.indexOf("text/event-stream") >= 0, "la cabecera se relaya por TLS")
+    assert(g_t_uno[0] > 0 and g_t_dos[0] > 0, "los dos eventos llegan por TLS")
+    assert(g_t_uno[0] < g_t_dos[0], "en orden")
+    assert(d_uno < 400, "el primero llega antes de que el upstream escriba el segundo")
+    assert(d_sep > 300, "la pausa del upstream se preserva también sobre TLS")
+    print("PASS: el túnel funciona sobre TLS, que es el sink de producción")
+    return 0
+}
+
+
+fn main() -> int {
+    test_sse_sobre_tls()
+    print("")
+    print("ALL nyx-proxy SSE over TLS tests passed")
+    return 0
+}
