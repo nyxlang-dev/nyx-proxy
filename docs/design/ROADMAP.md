@@ -15,9 +15,7 @@
 
 ## Arcos vivos
 
-| Arco | Plan | Qué |
-|---|---|---|
-| `sse-tunnel` | `docs/design/plans/2026-09-20-sse-tunnel.md` | túnel de un sentido para `text/event-stream`; responde el encargo de la Task 6 de `serve-sse` |
+_(ninguno)_
 
 ## Encargos abiertos
 
@@ -28,7 +26,7 @@ lado la mencionaba.
 
 | Encargo | De | Estado |
 |---|---|---|
-| `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **en curso** — arco `sse-tunnel` |
+| `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
 
 ## Cómo se trabaja acá
 
