@@ -61,6 +61,23 @@ hasta que el upstream cierre.** [arco: sse-tunnel]
   `ws_proxy` no lo tenían, así que ni el binario de referencia ni el ejemplo
   `gateway-tls` compilaban — y los dos están en CI. No lo cazó nadie porque el
   binario commiteado era anterior al cambio del compilador.
+- **fix (estabilidad, encontrado al cubrir el sink TLS)**: un cliente TLS que
+  cerraba mataba EL PROCESO ENTERO por SIGPIPE. Este runtime no instala un
+  `SIG_IGN` global —el `MSG_NOSIGNAL` de `os_sock_send` es «load-bearing», lo
+  dice su propio comentario— y OpenSSL escribe con `write()` crudo, así que un
+  `tls_write_conn` contra un peer que ya cerró se lleva puesto el proceso. En el
+  camino normal la ventana es de milisegundos y por eso nunca se había visto; en
+  un túnel dura lo que dure el stream, o sea que alcanzaba con cerrar la pestaña
+  para tirar un gateway con todos sus dominios. Medido: sin el fix,
+  `tests/test_proxy_sse_tls.nx` muere con rc=141 (128+SIGPIPE) sin alcanzar a
+  imprimir una línea. Es un bug del runtime, no del proxy —afecta igual a
+  `ws_tunnel` y al camino normal, con ventana más corta— y está reportado al repo
+  del lenguaje; acá se mitiga donde el riesgo es real.
+- Suite nueva `tests/test_proxy_sse_tls.nx` (1 caso): el túnel sobre TLS, que es
+  el sink que corre en producción, con certificado autofirmado generado al vuelo
+  y SKIP limpio si no hay `openssl`. Vive aparte porque `tls_server_init` publica
+  un contexto TLS global de proceso. Medido: primer evento a los 0-1 ms y la
+  pausa de 500 ms del upstream preservada.
 - Fuera de alcance, sin cambio: el `access_log` y las métricas de un túnel se
   emiten al ABRIR, con la latencia hasta la cabecera. Registrarlas al cerrar
   metería la duración entera del stream en el histograma y destruiría el p99 del
