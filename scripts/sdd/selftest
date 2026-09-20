@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# scripts/sdd/selftest — control positivo de los scripts del método SDD (spec §8).
+# Monta un repo de juguete en $(mktemp -d) — nunca toca el repo real — y corre contra él los
+# scripts base con casos verdes Y con mutaciones que DEBEN fallar: cada mutación rompe una regla
+# distinta y se verifica que state-check la reporte con SU código ([sdd.a]…[sdd.j]) — un guard
+# que falla por el motivo equivocado es peor que no tenerlo. El ciclo arc-* lo cubre
+# selftest-arc. Corre como `make sdd-check`, para que el método no se pudra.
+set -u
+
+SDD="$(cd "$(dirname "$0")" && pwd -P)"; FIX="$(cd "$(mktemp -d)" && pwd -P)"
+SNAP="$FIX.snap"; MUT="$FIX.mut"; NOG="$FIX.nogit"; WT="$FIX.wt"
+trap 'cd /; rm -rf "$FIX" "$SNAP" "$MUT" "$NOG" "$WT"' EXIT
+export DOCS_HEALTH_ROOT="$FIX"
+N=0; BAD=0
+ok() { N=$((N + 1)); printf '  ✓ %s\n' "$1"; }
+ko() { N=$((N + 1)); BAD=$((BAD + 1)); printf '  ✗ %s\n' "$1"; }
+chk() { if [ "$2" = "$3" ]; then ok "$1"; else ko "$1 — esperaba «$3», dio «$2»"; fi; }
+
+# ---------------- fixture ----------------
+mkdir -p "$FIX"/docs/design/{plans,specs,spikes,reviews} && cd "$FIX" || exit 1
+git init -q .
+git config user.email 'sdd@example.invalid'; git config user.name 'sdd-selftest'
+printf '.sdd/\n' > .gitignore
+# ROADMAP hace de doc raíz (acá no hay PLAN.md): es de donde cuelga un VIGENTE.
+printf '# ROADMAP\n\n- Arco demo: `docs/design/plans/2026-09-20-demo.md`\n' > docs/design/ROADMAP.md
+mkdir -p scripts && printf 'case "$f" in .sdd/*) continue ;; esac\n' > scripts/limpia.sh
+printf '# índice\n\n## Tabla completa\n\n<!-- index:begin -->\n<!-- index:end -->\n\n## Notas\n\nManual.\n' > docs/design/INDEX.md
+cat > docs/design/plans/2026-09-20-demo.md <<'EOF'
+> **ESTADO: VIGENTE** — GO Ottavio 2026-09-20, modo sdd
+
+# Demo — Implementation Plan
+
+## Global Constraints
+
+- Rama: arc/demo
+
+### Task 1: uno
+
+Prueba del fence: el heading de abajo NO es una task.
+
+```markdown
+### Task 9: falsa
+```
+
+### Task 2: dos
+
+Cuerpo de la task 2.
+
+## Verificación E2E
+
+Nada.
+EOF
+printf '> **ESTADO: COMPLETO** — arco cerrado\n\n# Viejo\n' > docs/design/specs/2026-07-01-viejo-design.md
+git add -A && git commit -qm 'fixture inicial'
+printf -- '- nota agregada\n' >> docs/design/ROADMAP.md
+sed -i 's/^Manual\.$/Manual (revisado)./' docs/design/INDEX.md  # 1 alta + 1 baja: net != altas
+git add -A && git commit -qm 'segundo commit: 2 archivos'
+cp -a "$FIX" "$SNAP"
+PLAN='docs/design/plans/2026-09-20-demo.md'
+
+# ---------------- casos verdes ----------------
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?   # sin .sdd/ todavía: sale 0 con el WARN de (h)
+chk "state-check verde sobre el fixture" "$rc:$(printf '%s' "$out" | tail -1)" "0:✓ state-check"
+
+bash "$SDD/index-gen" >/dev/null 2>&1
+chk "index-gen escribe 2 filas" "$(grep -c '^| `docs/design/' docs/design/INDEX.md)" "2"
+
+bash "$SDD/index-gen" --check >/dev/null 2>&1
+chk "index-gen --check verde tras generar" "$?" "0"
+
+sed -i '1s/COMPLETO/VIGENTE/' docs/design/specs/2026-07-01-viejo-design.md
+bash "$SDD/index-gen" --check >/dev/null 2>&1
+chk "index-gen --check caza el INDEX desfasado" "$?" "1"
+sed -i '1s/VIGENTE/COMPLETO/' docs/design/specs/2026-07-01-viejo-design.md
+
+# PORTE: un .md suelto en reviews/ lleva fila propia. En el repo del lenguaje index-gen solo
+# listaba CARPETAS de reviews/, así que un review suelto quedaba fuera del índice y ninguna
+# guarda lo cazaba (verificado allá: grep del archivo en su INDEX.md da 0).
+printf '# repro suelto\n' > docs/design/reviews/2026-09-20-repro.md
+bash "$SDD/index-gen" >/dev/null 2>&1
+chk "index-gen indexa el .md suelto de reviews/" \
+    "$(grep -c '^| `docs/design/reviews/2026-09-20-repro.md`' docs/design/INDEX.md)" "1"
+rm -f docs/design/reviews/2026-09-20-repro.md; bash "$SDD/index-gen" >/dev/null 2>&1
+
+b2=$(bash "$SDD/task-brief" "$PLAN" 2 2>/dev/null)   # sin el Task 9 del fence ni el E2E
+chk "task-brief 2 extrae su bloque y corta antes del heading siguiente" \
+    "$(grep -c '^### Task 2\|Task 9\|Verificación E2E' "${b2:-/dev/null}")" "1"
+
+b1=$(bash "$SDD/task-brief" "$PLAN" 1 2>/dev/null)
+if [ -n "$b1" ] && grep -q '### Task 9: falsa' "$b1"; then
+    ok "task-brief 1 respeta el fence (el heading falso no corta)"
+else ko "task-brief 1 cortó en el heading dentro del fence"; fi
+
+bash "$SDD/task-brief" "$PLAN" 3 >/dev/null 2>&1
+chk "task-brief de una task inexistente sale 3" "$?" "3"
+
+prog=$(bash "$SDD/ledger-new" "$PLAN" 2>/dev/null)
+chk "ledger-new escribe la línea de identidad" "$(head -1 "$prog" 2>/dev/null)" "# SDD ledger — plan: $PLAN"
+
+# El fixture tiene Task 1, Task 2 y un «### Task 9» DENTRO de un fence: el checklist tiene que
+# sembrar dos marcas, no tres — el mismo patrón de heading que task-brief y arc-close.
+chk "ledger-new siembra una marca pendiente por task y respeta el fence" \
+    "$(grep -c '^- \[ \] Task [0-9]' "${prog:-/dev/null}")" "2"
+chk "el checklist sembrado nombra la task por su título" \
+    "$(grep -c '^- \[ \] Task 2 — dos$' "${prog:-/dev/null}")" "1"
+
+# LO CRÍTICO: lo sembrado no puede hacerse pasar por marcas reales. arc-close las busca
+# ancladas a principio de línea; si el ejemplo del ledger matcheara, un arco cerraría sin que
+# nadie haya revisado nada — exactamente lo contrario de para lo que se siembra.
+chk "ninguna línea sembrada matchea las marcas ancladas que lee arc-close" \
+    "$(grep -cE '^Task [0-9]+: (review|complete|skipped)' "${prog:-/dev/null}")" "0"
+
+bash "$SDD/ledger-new" "$PLAN" >/dev/null 2>&1
+chk "ledger-new sobre un ledger existente sale 2" "$?" "2"
+
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "state-check verde con ledger vivo y sin WARN" "$rc:$out" "0:✓ state-check"
+
+bash "$SDD/state-check" "$FIX" 2>&1 | grep -q '\[sdd.g\]' \
+    && ko "(g) dispara sobre un .sh con .sdd/" || ok "(g) solo mira .md: el .sh trackeado no dispara"
+mkdir -p docs/design/briefs/2026-09-20-demo; printf 'extracto: ver `.sdd/2026-09-20-demo/x.md`\n' > docs/design/briefs/2026-09-20-demo/task-1.md; git add -A
+bash "$SDD/state-check" "$FIX" 2>&1 | grep -q '\[sdd.g\]' \
+    && ko "(g) dispara sobre un encargo TRACKEADO" || ok "(g) exime briefs/: el extracto de una task puede citar el ledger"
+
+# PORTE: el buzón de encargos RECIBIDOS no tiene plan local (su plan vive en el otro repo), así
+# que (f) tiene que eximirlo o el repo queda rojo por recibir un encargo — que es exactamente lo
+# que el método vino a arreglar.
+mkdir -p docs/design/briefs/_recibidos
+printf '# Encargo recibido\n\nviene de otro repo\n' > docs/design/briefs/_recibidos/otro-repo-task-6.md
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "(f) exime el buzón _recibidos: un encargo de otro repo no exige plan local" "$rc:$out" "0:✓ state-check"
+
+BORR=docs/design/specs/2026-09-21-borrador-design.md
+printf '> **ESTADO: BORRADOR** — GO pendiente\n\n# Borrador\n' > "$BORR"
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "un BORRADOR sin cita ni ledger es legal en main (así se aprueba: leyéndolo)" "$rc:$out" "0:✓ state-check"
+rm -f "$BORR"
+
+stats=$(bash "$SDD/review-package" "$PLAN" HEAD~1 HEAD 2>/dev/null)
+chk "review-package imprime las stats del rango" "$stats" "stats: files=2 net=1"
+
+pkg=$(ls "$FIX"/.sdd/2026-09-20-demo/review-*.diff 2>/dev/null | head -1)
+chk "review-package deja las stats como última línea" "$(tail -1 "$pkg" 2>/dev/null)" "$stats"
+
+# ---------------- mutaciones: cada una debe fallar con SU código ----------------
+mut() {   # mut CÓDIGO FRAGMENTO-DEL-MOTIVO DESC CMD…
+    local code="$1" frag="$2" desc="$3" out rc; shift 3
+    rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+    ( cd "$MUT" && eval "$*" ) >/dev/null 2>&1
+    out=$(bash "$SDD/state-check" "$MUT" 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "[sdd.$code]" \
+       && printf '%s' "$out" | grep -qF "$frag"; then ok "mutación [sdd.$code] $desc"
+    else ko "mutación [sdd.$code] $desc no reportó código+motivo (rc=$rc) — $out"; fi
+}
+mut a "sin banner canónico"      "banner borrado"     "sed -i '1d' docs/design/specs/2026-07-01-viejo-design.md"
+mut b "sin cita viva ni ledger"  "VIGENTE sin cita"   "sed -i '/2026-09-20-demo.md/d' docs/design/ROADMAP.md"
+mut b "sin «GO Ottavio»"         "VIGENTE sin GO"     "sed -i '1s/.*/> **ESTADO: VIGENTE** — sin go/' $PLAN"
+mut c 'apunta a un archivo inexistente' 'SUPERSEDED colgado' 'printf "> **ESTADO: SUPERSEDED por \`no-existe.md\`** — x\n\n# Viejo\n" > docs/design/specs/2026-07-01-viejo-design.md'
+mut d "tasks no contiguas"       "hueco en las tasks" "sed -i 's/^### Task 1: uno/### Task T1: uno/' $PLAN"
+mut d "el cierre no es una task" "el cierre como task" "printf '\n### Task 3: cierre y merge\n\nX\n' >> $PLAN"
+mut e "brief en plans/"          "brief en plans/"    "printf '> **ESTADO: COMPLETO**\n\n# x\n' > docs/design/plans/2026-09-20-x-brief.md"
+mut f "encargos sin plan"        "encargos sin plan"  "mkdir -p docs/design/briefs/inexistente && printf 'x\n' > docs/design/briefs/inexistente/task-1.md"
+mut g "cita al ledger efímero"   "ledger citado en un .md durable" "printf 'ver .sdd/2026-09-20-demo/progress.md\n' > NOTA.md && git add -A"
+mut h "ledger huérfano"          "ledger huérfano"    "mkdir -p .sdd/huerfano && printf '# SDD ledger\n' > .sdd/huerfano/progress.md"
+mut i "steps ya completos"       "BORRADOR ya ejecutado" \
+    "sed -i '1s/.*/> **ESTADO: BORRADOR** — GO pendiente/' $PLAN && printf '\n- [x] **Step 1:** hecho\n' >> $PLAN"
+mut j "ruta absoluta de máquina" "scratchpad muerto en un encargo" \
+    "mkdir -p docs/design/briefs/2026-09-20-demo && printf '# Brief\n\nlas notas están en /tmp/claude-1000/proyecto/abc-123/scratchpad/notas.md\n' > docs/design/briefs/2026-09-20-demo/task-1.md"
+mut j "ruta absoluta de máquina" "ruta Windows en un encargo" \
+    "mkdir -p docs/design/briefs/2026-09-20-demo && printf '%s\n' '# Brief' 'el objeto queda en C:\build\runtime.obj' > docs/design/briefs/2026-09-20-demo/task-1.md"
+# LAS DOS QUE JUSTIFICAN EL PORTE DE (j): este repo es PÚBLICO y arc-close cosecha el ledger a
+# docs/archive/sdd/ y lo COMMITEA. En el repo del lenguaje (j) miraba solo los briefs, así que
+# una cosecha con rutas de máquina se publicaba sin que nada chistara.
+mut j "ruta absoluta de máquina" "home de usuario en la COSECHA publicada" \
+    "mkdir -p docs/archive/sdd/2026-09-20-demo && printf '# SDD ledger\n\nel binario quedó en /home/admin/nyx/products/proxy/nyx-proxy\n' > docs/archive/sdd/2026-09-20-demo/progress.md"
+mut j "ruta absoluta de máquina" "montaje WSL en un plan" \
+    "printf '\nel checkout está en /mnt/c/repos/proxy\n' >> $PLAN"
+
+# (j) caso VERDE: un documento bien escrito usa rutas relativas al repo, el layout canónico
+# ~/nyx/… y a lo sumo un /tmp/<archivo> suelto (válido en cualquier Linux). Nada de eso puede dar
+# rojo, o la guarda sería inservible: obligaría a escribir encargos sin comandos.
+rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+mkdir -p "$MUT/docs/design/briefs/2026-09-20-demo"
+printf '# Brief\n\ncd ~/nyx/products/proxy && make test-proxy 2>&1 | tee /tmp/test.log\nver scripts/run_unit_tests.sh\n' \
+    > "$MUT/docs/design/briefs/2026-09-20-demo/task-1.md"
+out=$(bash "$SDD/state-check" "$MUT" 2>&1); rc=$?
+chk "(j) no molesta a un doc con rutas relativas, ~/nyx/… y /tmp/<archivo>" "$rc:$(printf '%s' "$out" | tail -1)" "0:✓ state-check"
+
+# .git como ARCHIVO («gitdir: …», worktree): sigue siendo un repo ⇒ (g) mira solo lo trackeado.
+cp -a "$SNAP" "$WT"; mv "$WT/.git" "$WT/.gitdir"; printf 'gitdir: %s\n' "$WT/.gitdir" > "$WT/.git"
+mkdir -p "$WT/.sdd/2026-09-20-demo" && printf '# SDD ledger\n\nreview: .sdd/2026-09-20-demo/x.diff\n' > "$WT/.sdd/2026-09-20-demo/progress.md"
+out=$(bash "$SDD/state-check" "$WT" 2>&1); rc=$?
+chk "state-check con .git-archivo (worktree) no escanea el ledger" "$rc:$out" "0:✓ state-check"
+
+# Sin .git, (g) tiene que caer al fallback de `find` en vez de `git ls-files`.
+cp -a "$SNAP" "$NOG"; rm -rf "$NOG/.git"
+printf 'ver .sdd/2026-09-20-demo/progress.md\n' > "$NOG/NOTA.md"
+if bash "$SDD/state-check" "$NOG" 2>&1 | grep -qF '[sdd.g]'; then
+    ok "state-check sin .git cae al fallback de find"
+else ko "state-check sin .git no listó los archivos (fallback de find roto)"; fi
+
+# El ciclo por comando (arc-new/brief/arc-close) monta un fixture distinto — rama main, ledger
+# completo, CHANGELOG etiquetado — así que vive en selftest-arc y suma acá sus casos.
+arc=$(bash "$SDD/selftest-arc" 2>&1); printf '%s\n' "$arc" | grep -v '^TOTAL '
+set -- $(printf '%s\n' "$arc" | awk '/^TOTAL /{print $2, $3}'); N=$((N + ${1:-0})); BAD=$((BAD + ${2:-1}))
+
+[ "$BAD" -gt 0 ] && { printf '✗ sdd-selftest: %d de %d casos fallaron\n' "$BAD" "$N"; exit 1; }
+printf '✓ sdd-selftest: %d casos\n' "$N"
+exit 0

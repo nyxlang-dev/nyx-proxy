@@ -7,3 +7,7 @@ packages/
 *.o
 .DS_Store
 CLAUDE.local.md
+
+# Ledger de ejecución del método SDD: efímero por diseño, con la ruta derivable
+# del plan. Se cosecha a docs/archive/sdd/ al cerrar el arco (arc-close).
+.sdd/

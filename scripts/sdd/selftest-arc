@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# scripts/sdd/selftest-arc — control positivo del CICLO por comando: arc-new, brief y arc-close
+# (spec §2, §5, §6, §10). Lo invoca `selftest` y le suma sus casos (última línea:
+# «TOTAL <casos> <fallos>»). Monta su propio repo de juguete en $(mktemp -d) — nunca toca el
+# repo real, y menos el ledger vivo — con rama main, ledger completo y CHANGELOG etiquetado.
+# Lo que verifica y no se puede verificar leyendo el script: que arc-close NO ESCRIBA NADA
+# cuando falta algo (cada mutación exige exit 1 CON su motivo y sin cosecha en disco), que con
+# --no-commit el ledger siga en su lugar, y que los guards de --retro no borren medio repo.
+# PORTE: el lenguaje partía esto en tres archivos (selftest-arc, -arc2, -3) por su límite de 150
+# líneas por script. Acá están consolidados: se caen los casos de PLAN.md, PROJECT_STATE.md,
+# SESSION_LOG y el check 10, que en este repo no existen.
+set -u
+
+SDD="$(cd "$(dirname "$0")" && pwd -P)"
+FIX="$(cd "$(mktemp -d)" && pwd -P)"; SNAP="$FIX.snap"; MUT="$FIX.mut"
+trap 'cd /; rm -rf "$FIX" "$SNAP" "$MUT"' EXIT
+export DOCS_HEALTH_ROOT="$FIX"
+
+HOY=$(date +%F); PLAN='docs/design/plans/2026-09-20-demo.md'; BASE='2026-09-20-demo'
+N=0; BAD=0
+ok() { N=$((N + 1)); printf '  ✓ %s\n' "$1"; }
+ko() { N=$((N + 1)); BAD=$((BAD + 1)); printf '  ✗ %s\n' "$1"; }
+chk() { if [ "$2" = "$3" ]; then ok "$1"; else ko "$1 — esperaba «$3», dio «$2»"; fi; }
+
+# ---------------- fixture ----------------
+mkdir -p "$FIX"/docs/design/{plans,specs,spikes} && cd "$FIX" || exit 1
+git init -q -b main . 2>/dev/null || { git init -q .; git checkout -q -b main; }
+git config user.email 'sdd@example.invalid'; git config user.name 'sdd-selftest'
+printf '.sdd/\n' > .gitignore
+printf '# ROADMAP\n\n- Arco demo: `%s` (spec `docs/design/specs/2026-09-20-demo-design.md`)\n' "$PLAN" > docs/design/ROADMAP.md
+# CHANGELOG con el formato de ESTE repo («## v0.1.0 — fecha»), no el del lenguaje
+# («## [Unreleased]»). Es el caso que prueba el fix del awk de arc-close: con el patrón
+# original (/^## \[/) esta etiqueta no se encontraba NUNCA y ningún cierre pasaba.
+printf '# Changelog\n\n## v0.1.0 — %s\n\n- método demo [arco: demo]\n' "$HOY" > CHANGELOG.md
+printf '# índice\n\n<!-- index:begin -->\n<!-- index:end -->\n' > docs/design/INDEX.md
+cat > "$PLAN" <<'EOF'
+> **ESTADO: VIGENTE** — GO Ottavio 2026-09-20, modo sdd
+
+# Demo — Implementation Plan
+
+## Global Constraints
+
+- Gate humano de merge: no
+
+### Task 1: uno
+
+Cuerpo de la task 1. Acá se menciona «Gate humano de merge: sí» DENTRO de una task, que no
+cuenta: el gate se lee solo en Global Constraints.
+
+### Task 2: dos
+
+Cuerpo de la task 2.
+EOF
+printf '> **ESTADO: COMPLETO** — arco viejo\n\n# Viejo\n' > docs/design/specs/2026-07-01-viejo-design.md
+printf '> **ESTADO: VIGENTE** — GO Ottavio 2026-09-20\n\n# Demo — diseño\n' > docs/design/specs/2026-09-20-demo-design.md
+mkdir -p ".sdd/$BASE"; printf '# Report task 1\n' > ".sdd/$BASE/task-1-report.md"
+# El ledger del fixture NACE SEMBRADO por ledger-new, no escrito a mano: así el cierre verde de
+# más abajo prueba E2E lo único que la siembra podría romper — que un ledger con el checklist de
+# marcas pendientes cierre igual. Las marcas reales se anexan.
+bash "$SDD/ledger-new" "$PLAN" >/dev/null 2>&1
+chk "el ledger del fixture nace con el checklist de marcas pendientes (2 tasks)" \
+    "$(grep -c '^- \[ \] Task [0-9]' ".sdd/$BASE/progress.md" 2>/dev/null)" "2"
+{ printf 'Task 1: review Approved (sonnet)\nTask 1: complete (aaaaaaa..bbbbbbb)\n'
+  printf 'Task 2: skipped — Ruling: ya estaba — porqué: x — costo si está mal: y\n'; } >> ".sdd/$BASE/progress.md"
+git add -A && git commit -qm 'fixture'
+
+# ---------------- arc-new ----------------
+p2=$(bash "$SDD/arc-new" demo2 --plan "Demo dos" 2>/dev/null)
+chk "arc-new --plan siembra Task 1, E2E y banner «GO pendiente»" \
+    "$(grep -c '^### Task 1:\|^## Verificación E2E\|GO pendiente' "${p2:-/dev/null}")" "3"
+
+chk "arc-new sin --go siembra el banner BORRADOR" \
+    "$(head -1 "${p2:-/dev/null}")" '> **ESTADO: BORRADOR** — GO pendiente'
+
+chk "arc-new siembra los gates de ESTE repo, no los del lenguaje" \
+    "$(grep -c 'make test-proxy.*make build.*make sdd-check' "${p2:-/dev/null}")" "1"
+
+chk "arc-new no siembra la dependencia del plugin superpowers (repo público)" \
+    "$(grep -ci 'superpowers' "${p2:-/dev/null}")" "0"
+
+# Un borrador sin GO ni cita es LEGAL en main: así es como se aprueba, leyéndolo.
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "el plan BORRADOR sin GO ni cita NO es violación" \
+    "$rc:$(printf '%s' "$out" | grep -cF '[sdd.b]')" "0:0"
+
+# ...pero no puede disfrazarse de trabajo en curso: steps ya completos.
+printf -- '- [x] **Step 1:** ya hecho\n' >> "$p2"
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "(i) plan BORRADOR con steps ya marcados como completos" \
+    "$rc:$(printf '%s' "$out" | grep -c '\[sdd.i\].*steps ya completos')" "1:1"
+sed -i '/^- \[x\] \*\*Step 1:\*\* ya hecho$/d' "$p2"
+
+# arc-close no cierra un borrador, y lo dice con el camino de salida (no «no está VIGENTE»).
+# Commit previo: la precondición de árbol limpio corre ANTES del banner y taparía el mensaje.
+git add -A && git commit -qm 'borrador demo2 sembrado'
+out=$(cd "$FIX" && DOCS_HEALTH_ROOT="$FIX" bash "$SDD/arc-close" "$p2" --no-commit 2>&1); rc=$?
+chk "arc-close rechaza un plan en BORRADOR con un mensaje que dice qué hacer" \
+    "$rc:$(printf '%s' "$out" | grep -c 'está en BORRADOR.*sin GO no se cierra.*pedile el GO')" "1:1"
+
+rm -f "$p2"; p2=$(bash "$SDD/arc-new" demo2 --plan "Demo dos" --go 2>/dev/null)
+printf -- '- Arco demo2: `%s`\n' "$p2" >> docs/design/ROADMAP.md
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?
+chk "state-check verde tras --go + cita en ROADMAP" "$rc:$out" "0:✓ state-check"
+
+viejo=docs/design/specs/2026-07-01-viejo-design.md; s2=$(bash "$SDD/arc-new" viejo --spec "Viejo revisado" --go --supersedes "$viejo" 2>/dev/null)
+if head -1 "$viejo" | grep -qF "> **ESTADO: SUPERSEDED por \`$(basename "${s2:-x}")\`**"; then
+    ok "arc-new --supersedes reescribe el banner del reemplazado"
+else ko "arc-new --supersedes no tocó $viejo — $(head -1 "$viejo")"; fi
+chk "arc-new --spec siembra Contexto/Decisión/Fuera de alcance/Riesgos" \
+    "$(grep -c '^## \(Contexto\|Decisión\|Fuera de alcance\|Riesgos\)' "${s2:-/dev/null}")" "4"
+printf -- '- Spec viejo revisado: `%s`\n' "$s2" >> docs/design/ROADMAP.md
+
+# ---------------- brief ----------------
+out=$(bash "$SDD/brief" "$PLAN" 1 --remote 2>&1); rc=$?
+chk "brief --remote se niega en main" "$rc:$(printf '%s' "$out" | grep -c 'no corre en main')" "1:1"
+git checkout -q -b arc/demo
+b1=$(bash "$SDD/brief" "$PLAN" 1 --remote --exec laptop 2>/dev/null)
+chk "brief --remote escribe la cabecera (GO/rama/base/Reporte) y el extracto" \
+    "$b1:$(grep -cE '^GO: .+ · rama: arc/demo · base: [0-9a-f]{7} · ejecuta: laptop$|^Reporte: .+/task-1-report\.md.+$|^## Task$|^### Task 1: uno$|^## Ajustes del coordinador$' "${b1:-/dev/null}")" \
+    "docs/design/briefs/$BASE/task-1.md:5"
+chk "brief --remote deja el encargo staged" "$(git diff --cached --name-only -- "$b1")" "$b1"
+
+bash "$SDD/index-gen" --check >/dev/null 2>&1   # sin regeneración manual: la hace el propio brief
+chk "brief --remote deja el INDEX al día (index-gen --check verde)" "$?" "0"
+chk "index-gen lista docs/design/briefs/<base>/ como una sola fila" \
+    "$(grep -c "^| \`docs/design/briefs/$BASE\` .*| briefs |" docs/design/INDEX.md)" "1"
+
+bash "$SDD/brief" "$PLAN" 3 --remote >/dev/null 2>&1
+chk "brief de una task inexistente propaga el exit 3" "$?" "3"
+
+out=$(bash "$SDD/brief" "$PLAN" 1 --remote --fix 2 2>&1); rc=$?
+chk "brief --fix sin --notes se rechaza" "$rc:$(printf '%s' "$out" | grep -c -- '--notes')" "1:1"
+
+b2=$(bash "$SDD/brief" "$PLAN" 2 2>/dev/null)
+chk "brief sin --remote delega en task-brief (ledger)" "$b2" "$FIX/.sdd/$BASE/task-2-brief.md"
+
+git checkout -q main
+sed -i "/$BASE.md/d" docs/design/ROADMAP.md   # el arco se saca de los arcos vivos antes de cerrar
+git add -A && git commit -qm 'encargo + ROADMAP sin el arco'; cp -a "$FIX" "$SNAP"
+
+# ---------------- arc-close: mutaciones (nada se escribe si falta algo) ----------------
+amut() {   # amut FRAGMENTO-DEL-MOTIVO DESC CMD…
+    local frag="$1" desc="$2" out rc; shift 2
+    rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+    ( cd "$MUT" && eval "$*" ) >/dev/null 2>&1
+    out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" "$PLAN" --no-commit 2>&1); rc=$?
+    if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$frag" && [ ! -d "$MUT/docs/archive/sdd/$BASE" ]; then
+        ok "arc-close rechaza sin escribir: $desc"
+    else ko "arc-close: $desc (rc=$rc, ¿cosecha?=$([ -d "$MUT/docs/archive/sdd/$BASE" ] && echo sí || echo no)) — $out"; fi
+}
+amut 'CHANGELOG.md sin la etiqueta' 'sin [arco: demo] en el CHANGELOG' \
+    "sed -i '/arco: demo/d' CHANGELOG.md && git commit -aqm mut"
+amut 'sin «review» previa' 'Task 1 complete sin review previa' \
+    "sed -i '/Task 1: review/d' .sdd/$BASE/progress.md"
+amut 'sigue citado en docs/design/ROADMAP.md' 'el arco sigue en los arcos vivos' \
+    "printf -- '- \`%s\`\n' '$PLAN' >> docs/design/ROADMAP.md && git commit -aqm mut"
+amut 'sin report' 'Task 1 sin task-1-report.md' "rm -f .sdd/$BASE/task-1-report.md"
+amut 'quedaría VIGENTE sin cita viva' 'el spec del slug quedaría VIGENTE y sin cita' ':'
+amut 'exige gate de merge' 'Global Constraints pide gate y el ledger no lo tiene' \
+    "sed -i 's/^- Gate humano de merge: no\$/- Gate humano de merge: sí/' $PLAN && git commit -aqm mut"
+# LA MUTACIÓN QUE JUSTIFICA §10: el repo es PÚBLICO y la cosecha se commitea. Un ledger con una
+# ruta de máquina tiene que frenar el cierre ANTES de escribir, no quedar en la historia de git.
+amut 'cita una ruta de máquina' 'el ledger publicaría un home de usuario' \
+    "printf 'el binario quedó en /home/admin/nyx/products/proxy/nyx-proxy\n' >> .sdd/$BASE/progress.md"
+amut 'cita una ruta de máquina' 'un report publicaría un scratchpad de sesión' \
+    "printf 'notas en /tmp/claude-1000/x/y/scratchpad/n.md\n' >> .sdd/$BASE/task-1-report.md"
+
+# ---------------- arc-close: guards de --retro (que no borren medio repo) ----------------
+rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" .sdd --retro --no-commit 2>&1); rc=$?
+chk "--retro .sdd/ se niega (cosecharía un stub y borraría TODOS los ledgers)" \
+    "$rc:$([ -d "$MUT/.sdd/$BASE" ] && echo intacto)" "1:intacto"
+out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" docs --retro --no-commit 2>&1); rc=$?
+chk "--retro docs/ se niega (no cuelga de .sdd/)" "$rc:$([ -d "$MUT/docs/design" ] && echo intacto)" "1:intacto"
+out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" ".sdd/$BASE" --retro --no-commit 2>&1); rc=$?
+chk "--retro sobre un ledger real cosecha sin borrar (--no-commit)" \
+    "$rc:$([ -f "$MUT/docs/archive/sdd/$BASE/progress.md" ] && echo cosechado):$([ -d "$MUT/.sdd/$BASE" ] && echo intacto)" \
+    "0:cosechado:intacto"
+
+# --abandon: cierra sin exigir las validaciones del ledger, con el motivo en el banner.
+rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" "$PLAN" --abandon "no se hace" --close-spec --no-commit 2>&1); rc=$?
+chk "--abandon deja el banner ABANDONADO con el motivo" \
+    "$rc:$(head -1 "$MUT/$PLAN" | grep -c 'ESTADO: ABANDONADO.*no se hace')" "0:1"
+
+# Normalización de rutas: «./docs/…», la ruta absoluta y «docs/…» son el MISMO plan (la línea de
+# identidad del ledger se compara por igualdad de string).
+rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
+out=$(cd "$MUT" && DOCS_HEALTH_ROOT="$MUT" bash "$SDD/arc-close" "./$PLAN" --close-spec --no-commit 2>&1); rc=$?
+chk "arc-close acepta ./docs/… como el mismo plan" "$rc" "0"
+
+# ---------------- arc-close: cierre real con --no-commit ----------------
+out=$(bash "$SDD/arc-close" "$PLAN" --close-spec --no-commit 2>&1); rc=$?; dst="docs/archive/sdd/$BASE"
+[ "$rc" -eq 0 ] && ok "arc-close --no-commit cierra el arco completo" || ko "arc-close --no-commit falló (rc=$rc) — $out"
+chk "la cosecha lleva la línea Arco: COMPLETO" \
+    "$(grep -c '^Arco: COMPLETO (' "$dst/progress.md" 2>/dev/null)" "1"
+[ -f "$dst/task-1-report.md" ] && [ -f "$dst/briefs/task-1.md" ] \
+    && ok "la cosecha se lleva el report y los encargos" || ko "la cosecha perdió el report o los encargos"
+[ -f ".sdd/$BASE/progress.md" ] && ok "--no-commit deja el ledger intacto" || ko "--no-commit borró el ledger"
+chk "el plan queda COMPLETO" "$(head -1 "$PLAN" | cut -d' ' -f3)" "COMPLETO**"
+
+out=$(bash "$SDD/state-check" "$FIX" 2>&1); rc=$?   # (h): ledger + cosecha ya escrita = cierre en curso
+chk "el ledger con su cosecha en disco no es huérfano (sdd.h)" "$rc:$out" "0:✓ state-check"
+
+printf 'TOTAL %d %d\n' "$N" "$BAD"
+[ "$BAD" -eq 0 ]

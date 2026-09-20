@@ -167,6 +167,8 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 
 - [`docs/TUTORIAL.md`](docs/TUTORIAL.md) — Build a multi-domain HTTPS gateway ([ES](docs/TUTORIAL.es.md))
 - [`docs/CONFIG.md`](docs/CONFIG.md) — Full `proxy.toml` reference
+- [`AGENTS.md`](AGENTS.md) — Contributor playbook: source map, invariants, gotchas and test patterns
+- [`docs/design/ROADMAP.md`](docs/design/ROADMAP.md) — Live design arcs and open requests
 
 ## Limitations
 

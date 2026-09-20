@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# scripts/sdd/state-check [ROOT] — la guarda del método SDD en nyx-proxy (`make docs-health`).
+# Verifica de una sola pasada todo lo que el spec declara obligatorio: banner canónico (§2),
+# VIGENTE citado o con ledger y con GO desde la adopción (§2/§7), SUPERSEDED que apunta a algo
+# que existe, planes con tasks contiguas y sin task de cierre (§3), briefs en su carpeta y con
+# plan vivo (§5), ningún archivo trackeado citando el ledger efímero (§9), ningún ledger
+# huérfano (§4), ningún BORRADOR haciéndose pasar por trabajo en curso (§2/§7) y ninguna ruta
+# de máquina en lo que se PUBLICA (§10, propia de este repo).
+# Cada violación imprime «✗ [sdd.<letra>] <archivo>: <motivo>».
+# Regla de oro del spec: si una regla no tiene guarda, no es regla — este archivo ES esa lista.
+set -u
+. "$(dirname "$0")/lib.sh"
+
+ROOT="${1:-$(root_dir)}"
+cd "$ROOT" || die "no se pudo entrar a $ROOT"
+
+# Fecha de adopción del método en este repo. Todo documento de diseño con fecha POSTERIOR se
+# rige por las reglas nuevas (GO explícito, el cierre no es una task); los anteriores no
+# existen, pero el corte se deja explícito para que el día que se importe un documento viejo
+# no entre por la ventana.
+ADOPCION="2026-09-19"
+
+FAIL=0; WARN=0
+bad() { printf '✗ [sdd.%s] %s: %s\n' "$1" "$2" "$3"; FAIL=$((FAIL+1)); }
+DESIGN_DOCS=(docs/design/plans/*.md docs/design/specs/*.md docs/design/spikes/*.md)
+
+# --- (a) banner canónico en la línea 1 ---
+for f in "${DESIGN_DOCS[@]}"; do
+    [ -f "$f" ] || continue
+    head -1 "$f" | grep -qE "$BANNER_RE" || bad a "$f" "sin banner canónico en línea 1"
+done
+
+# --- (b) VIGENTE: citado por doc viva —raíz, o un nivel vía plan/spec VIGENTE que la raíz cita—
+#     o con ledger; GO Ottavio si la fecha es posterior a la adopción ---
+# La lista de docs raíz es la de ESTE repo. No hay PLAN.md ni PROJECT_STATE.md: el estado del
+# proxy vive fuera del repo (~/nyx/ops/proxy/) y no se puede grepear desde acá sin romper la
+# hermeticidad del fixture. docs/design/ROADMAP.md hace de PLAN.md local: es la única doc de
+# design/ que cuenta como raíz, y existe justamente para que un spec de referencia tenga de
+# dónde colgarse sin necesidad de un ledger vivo.
+root_cites() { grep -lF -- "$1" README.md AGENTS.md CAPABILITIES.md CHANGELOG.md docs/design/ROADMAP.md 2>/dev/null | head -1; }
+for f in "${DESIGN_DOCS[@]}"; do
+    [ -f "$f" ] || continue
+    [ "$(banner_of "$f")" = "VIGENTE" ] || continue
+    b=$(basename "$f")
+    cited=$(root_cites "$b")
+    if [ -z "$cited" ]; then
+        for p in docs/design/plans/*.md docs/design/specs/*.md; do
+            [ -f "$p" ] && [ "$p" != "$f" ] || continue
+            [ "$(banner_of "$p")" = "VIGENTE" ] && { [ -n "$(root_cites "$(basename "$p")")" ] || [ -d ".sdd/$(basename "$p" .md)" ]; } \
+                && grep -qF -- "$b" "$p" && { cited="$p"; break; }
+        done
+    fi
+    [ -n "$cited" ] || [ -d ".sdd/${b%.md}" ] || bad b "$f" "VIGENTE sin cita viva ni ledger"
+    d=$(printf '%s' "$b" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    if [ -n "$d" ] && [[ "$d" > "$ADOPCION" ]]; then
+        case "$(banner_suffix "$f")" in
+            *"GO Ottavio"*) ;;
+            *) bad b "$f" "VIGENTE con fecha $d (posterior a la adopción) sin «GO Ottavio» en el sufijo" ;;
+        esac
+    fi
+done
+
+# --- (c) SUPERSEDED apunta a un archivo que existe en el mismo directorio ---
+for f in "${DESIGN_DOCS[@]}"; do
+    [ -f "$f" ] || continue
+    t=$(head -1 "$f" | sed -nE 's/^> \*\*ESTADO: SUPERSEDED por `([^`]+)`\*\*.*/\1/p')
+    [ -n "$t" ] || continue
+    [ -f "$(dirname "$f")/$t" ] || bad c "$f" "SUPERSEDED apunta a un archivo inexistente: $t"
+done
+
+# --- (d) planes VIGENTE o BORRADOR: tasks 1..max contiguas (siempre) y el cierre NO es una task ---
+task_headings() {
+    awk '/^```/ { fence = !fence; next } !fence && /^#+[ \t]+Task[ \t]+[0-9]+/ { print }' "$1"
+}
+for f in docs/design/plans/*.md; do
+    [ -f "$f" ] || continue
+    # BORRADOR incluido: el formato de las tasks es lo que Ottavio LEE para dar el GO — un plan
+    # mal formado se caza antes de aprobarlo, no después.
+    case "$(banner_of "$f")" in VIGENTE|BORRADOR) ;; *) continue ;; esac
+    nums=$(task_headings "$f" | sed -E 's/^#+[ \t]+Task[ \t]+([0-9]+).*/\1/')
+    if [ -n "$nums" ]; then
+        max=$(printf '%s\n' $nums | sort -n | tail -1)
+        missing=""
+        i=1
+        while [ "$i" -le "$max" ]; do
+            printf '%s\n' $nums | grep -qx -- "$i" || missing="$missing $i"
+            i=$((i + 1))
+        done
+        [ -n "$missing" ] && bad d "$f" "tasks no contiguas (máximo Task $max) — faltan:$missing"
+    fi
+    d=$(basename "$f" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}')
+    if [ -n "$d" ] && [[ "$d" > "$ADOPCION" ]]; then
+        while IFS= read -r h; do
+            [ -n "$h" ] && bad d "$f" "el cierre no es una task: usar scripts/sdd/arc-close — «$h»"
+        done < <(task_headings "$f" | grep -iE 'cierre|merge|docs \+ gates|actualizar (CHANGELOG|README|AGENTS)')
+    fi
+done
+
+# --- (e) briefs disfrazados de plan ---
+while IFS= read -r b; do
+    [ -n "$b" ] && bad e "docs/design/plans/$b" "brief en plans/: va en docs/design/briefs/<plan>/"
+done < <(ls docs/design/plans/ 2>/dev/null | grep -E -- '-brief|-fixround')
+
+# --- (f) briefs/<base>/ ⇒ plans/<base>.md VIGENTE ---
+# Excepción del buzón: un encargo RECIBIDO de otro repo no tiene plan local (su plan vive
+# allá). Vive en docs/design/briefs/_recibidos/ y esta regla no le aplica — lo que sí le
+# aplica es (j), porque se publica igual.
+for d in docs/design/briefs/*/; do
+    [ -d "$d" ] || continue
+    [ "$(basename "$d")" = "_recibidos" ] && continue
+    p="docs/design/plans/$(basename "$d").md"
+    if [ ! -f "$p" ]; then bad f "$d" "encargos sin plan: falta $p"
+    elif [ "$(banner_of "$p")" != "VIGENTE" ]; then bad f "$d" "encargos con plan no VIGENTE: $p"
+    fi
+done
+
+# --- (g) ningún .md trackeado cita el ledger efímero ---
+# Solo `*.md`: la regla protege que la DOCUMENTACIÓN durable no apunte al ledger efímero. Un
+# patrón de exclusión dentro de un script (`case "$f" in .sdd/*)`) no es una cita. Exentos: el
+# spec y el plan del método (que describen la ruta), `docs/archive/*` ENTERO (historia
+# inmutable), los encargos de docs/design/briefs/ y scripts/sdd/.
+# La detección de repo va por `git rev-parse --is-inside-work-tree`, NO por `[ -d .git ]`: en
+# un worktree o un submódulo `.git` es un ARCHIVO («gitdir: …»), el test de directorio caía al
+# `find` y ese escanea untracked e ignorados — el ledger incluido, que es justo lo que esta
+# regla no debe mirar.
+tracked_md() {
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git ls-files -- '*.md'
+    else find . -type f -name '*.md' -not -path './.git/*' | sed 's|^\./||'; fi
+}
+while IFS= read -r f; do
+    case "$f" in
+        AGENTS.md) continue ;;
+        docs/design/specs/*-sdd-proxy-design.md) continue ;;
+        docs/design/plans/*-sdd-proxy.md) continue ;;
+        docs/archive/*|docs/design/briefs/*|scripts/sdd/*) continue ;;
+    esac
+    [ -f "$f" ] || continue
+    hit=$(grep -oIE '\.sdd/|\.superpowers' "$f" 2>/dev/null | head -1)
+    [ -n "$hit" ] && bad g "$f" "cita al ledger efímero («$hit»)"
+done < <(tracked_md | tr '\n' '\0' | xargs -0 -r grep -lIE '\.sdd/|\.superpowers' 2>/dev/null)
+
+# --- (h) ledger local ⇒ plan VIGENTE, o cosecha en curso (WARN si el checkout no tiene ledgers) ---
+# Un ledger cuyo docs/archive/sdd/<base>/ YA existe no es huérfano: es un arco que arc-close
+# está cerrando (cosecha primero, banner COMPLETO, guardas, commit, y recién ahí el `rm -rf`
+# del ledger) o que se cerró con --no-commit. Sin esta excepción, arc-close se rompería a sí
+# mismo al correr las guardas con el banner ya en COMPLETO.
+if [ ! -d .sdd ]; then
+    printf '⚠ [sdd.h] .sdd/: este checkout no tiene ledgers (WARN)\n'
+    WARN=$((WARN + 1))
+else
+    for d in .sdd/*/; do
+        [ -f "$d/progress.md" ] || continue
+        b=$(basename "$d")
+        p="docs/design/plans/$b.md"
+        [ -f "$p" ] && [ "$(banner_of "$p")" = "VIGENTE" ] || [ -d "docs/archive/sdd/$b" ] \
+            || bad h "$d" "ledger huérfano: cosechar con arc-close --retro o borrar"
+    done
+fi
+
+# --- (i) BORRADOR: legal en main, pero no es trabajo en curso ---
+# Un arco sembrado sin `--go` vive en main con banner BORRADOR y NO es violación: el flujo de
+# aprobación ES commitearlo y que Ottavio lo lea. Lo que un borrador no puede hacer es exhibir
+# steps ya marcados como completos. El segundo síntoma, un ledger sobre un plan sin GO, ya lo
+# caza (h), que exige plan VIGENTE.
+# NOTA DE PORTE: en el repo del lenguaje esta regla tenía una tercera mitad —«BORRADOR citado
+# como campaña ACTIVA de PLAN.md»— que acá NO existe, porque no hay PLAN.md. No se sustituye
+# por ROADMAP.md a propósito: ROADMAP lista arcos, no campañas empezadas, y citar un borrador
+# ahí es legítimo (es como se pide que lo lean). Sin archivo de campañas no hay regla que
+# romper; se documenta en vez de dejar una guarda que no guarda nada.
+for f in "${DESIGN_DOCS[@]}"; do
+    [ -f "$f" ] || continue
+    [ "$(banner_of "$f")" = "BORRADOR" ] || continue
+    case "$f" in docs/design/plans/*) ;; *) continue ;; esac
+    awk '/^```/ { fence = !fence; next } !fence && /^[ \t]*- \[[xX]\]/ { hit = 1 } END { exit !hit }' "$f" \
+        && bad i "$f" "plan BORRADOR con steps ya completos: un borrador no se ejecuta, se aprueba"
+done
+
+# --- (j) nada de lo que se PUBLICA cita una ruta absoluta de máquina ---
+# En el repo del lenguaje esta regla miraba solo docs/design/briefs/*/*.md, porque el riesgo
+# era que un encargo trajera rutas de la máquina que lo escribió. ACÁ EL RIESGO ES OTRO Y ES
+# MAYOR: este repo es PÚBLICO y todo commit se publica al instante. `arc-close` cosecha el
+# ledger entero —progress.md y todos los task-N-report.md— a docs/archive/sdd/ y lo commitea,
+# y un ledger real está lleno de rutas /home, de puertos de backends y de nombres de unidad de
+# producción. Por eso la regla cubre docs/design/** y docs/archive/sdd/**, y por eso arc-close
+# la corre como validación ANTES de escribir nada.
+# Se permite `~/nyx/...` (el layout canónico, documentado en ~/nyx/README.md) y `/tmp/<archivo>`
+# suelto; se rechazan el scratchpad de sesión, los home de usuario, los montajes de WSL y las
+# rutas Windows.
+publicado_md() {
+    find docs/design docs/archive -type f -name '*.md' 2>/dev/null | LC_ALL=C sort
+}
+while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    hit=$(grep -oIE '/tmp/claude-[0-9]+|/home/[a-z][a-z0-9_-]*|/mnt/[a-z]/|[A-Za-z]:\\' "$f" 2>/dev/null | head -1)
+    [ -n "$hit" ] && bad j "$f" "ruta absoluta de máquina («$hit») en un archivo que se publica: usar ~/nyx/…"
+done < <(publicado_md)
+
+if [ "$FAIL" -gt 0 ]; then
+    printf 'state-check: %d violación(es), %d warning(s)\n' "$FAIL" "$WARN"
+    exit 1
+fi
+printf '✓ state-check\n'
+exit 0

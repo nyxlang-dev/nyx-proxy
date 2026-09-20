@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# scripts/sdd/brief PLAN N [--remote] [--fix K] [--exec NOMBRE] [--notes ARCHIVO] — el encargo
+# de una task (spec §5). Sin `--remote` delega en task-brief (extracto al ledger efímero, para
+# un subagente de esta misma sesión). Con `--remote` escribe el encargo COMMITEABLE en
+# docs/design/briefs/<plan-basename>/task-N.md (o task-N-fixK.md) con la cabecera fija —
+# GO, rama, base, quién ejecuta y dónde va el reporte — y lo deja staged.
+# Por qué por git y no por chat: el relay perdido de W3 (2026-08-30) costó una task entera;
+# un encargo que no está en la rama no existe. Exige rama ≠ main (los encargos viven en la
+# rama del arco) y plan VIGENTE. Propaga el exit 3 de task-brief si la task no existe.
+# Se invoca desde la raíz del repo; imprime la ruta escrita.
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/lib.sh"
+
+uso='uso: brief PLAN N [--remote] [--fix K] [--exec NOMBRE] [--notes ARCHIVO]'
+plan=""; n=""; remote=""; fix=""; ejecuta="remoto"; notes=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --remote) remote=1 ;;
+        --fix) shift; fix="${1:-}"; [ -n "$fix" ] || die "--fix exige el número de ronda" ;;
+        --exec) shift; ejecuta="${1:-}"; [ -n "$ejecuta" ] || die "--exec exige un nombre" ;;
+        --notes) shift; notes="${1:-}"; [ -n "$notes" ] || die "--notes exige un archivo" ;;
+        -*) die "opción desconocida: $1 — $uso" ;;
+        *) if [ -z "$plan" ]; then plan="$1"; elif [ -z "$n" ]; then n="$1"
+           else die "argumento de más: $1 — $uso"; fi ;;
+    esac
+    shift
+done
+[ -n "$plan" ] && [ -n "$n" ] || die "$uso"
+
+root=$(root_dir); cd "$root" || die "no se pudo entrar a $root"
+[ -f "$plan" ] || die "plan no encontrado: $plan"
+[ "$(banner_of "$plan")" = "VIGENTE" ] || die "el plan no está VIGENTE: $plan (§2: solo un arco vivo reparte encargos)"
+
+if [ -z "$remote" ]; then
+    [ -z "$fix$notes" ] || die "--fix y --notes son de --remote: el brief local es el extracto crudo"
+    exec bash "$SELF_DIR/task-brief" "$plan" "$n"
+fi
+
+# --- encargo remoto: viaja por git ---
+rama=$(git branch --show-current 2>/dev/null)
+[ -n "$rama" ] && [ "$rama" != "main" ] \
+    || die "--remote no corre en main: el encargo va en la rama del arco (rama actual: «${rama:-?}»)"
+[ -z "$fix" ] || [ -n "$notes" ] || die "--fix $fix exige --notes ARCHIVO: una ronda de corrección sin el motivo no es un encargo"
+[ -z "$notes" ] || [ -f "$notes" ] || die "--notes: no existe $notes"
+
+base=$(base_of "$plan")
+tmp=$(mktemp) || die "mktemp falló"
+trap 'rm -f "$tmp"' EXIT
+bash "$SELF_DIR/task-brief" "$plan" "$n" "$tmp" >/dev/null
+rc=$?
+[ "$rc" -eq 3 ] && { printf 'sdd: la task %s no existe en %s\n' "$n" "$plan" >&2; exit 3; }
+[ "$rc" -eq 0 ] || die "task-brief falló (rc=$rc)"
+
+dir="docs/design/briefs/$base"
+out="$dir/task-$n.md"
+[ -z "$fix" ] || out="$dir/task-$n-fix$fix.md"
+[ -e "$out" ] && die "ya existe: $out (una ronda nueva va con --fix K)"
+mkdir -p "$dir" || die "no se pudo crear $dir"
+
+{
+    printf '# Brief — Task %s de %s\n\n' "$n" "$base"
+    printf 'GO: %s · rama: %s · base: %s · ejecuta: %s\n' \
+        "$(date +%F)" "$rama" "$(git rev-parse --short=7 HEAD 2>/dev/null)" "$ejecuta"
+    printf 'Reporte: escribir `%s/task-%s-report.md` y commitearlo en la rama.\n\n' "$dir" "$n"
+    printf '## Task\n\n'
+    cat "$tmp"
+    printf '\n## Ajustes del coordinador\n\n'
+    [ -z "$notes" ] || cat "$notes"
+    printf ''
+} > "$out" || die "no se pudo escribir $out"
+
+git add "$out" >/dev/null 2>&1 || printf 'sdd: aviso: no se pudo hacer git add de %s\n' "$out" >&2
+printf '%s\n' "$out"
+# El INDEX lleva una fila por CARPETA de briefs/: el primer encargo de un arco la estrena y
+# dejaría el check 8 (index-gen --check) rojo. Se regenera acá, igual que arc-new.
+bash "$SELF_DIR/index-gen" >/dev/null || die "$out quedó escrito, pero index-gen falló (¿INDEX sin marcadores <!-- index:begin/end -->?)"

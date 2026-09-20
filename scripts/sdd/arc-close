@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# scripts/sdd/arc-close PLAN [--abandon MOTIVO] [--close-spec] [--retro] [--no-commit] — el
+# cierre de un arco en un comando (spec §6); `--retro .sdd/<dir>` cosecha un ledger SIN plan.
+# Regla de oro: TODAS las validaciones ocurren ANTES de la primera escritura — si falta la
+# etiqueta del CHANGELOG, un report, una review o si la cosecha fuera a publicar una ruta de
+# máquina, no se toca nada y se sale 1. Después cosecha el ledger efímero a
+# docs/archive/sdd/<plan-basename>/ (progress + reports, sin diffs), mueve los encargos, pone
+# el banner, regenera el INDEX, corre las guardas, commitea y SOLO ENTONCES borra el ledger:
+# una sesión cortada a mitad nunca lo pierde. Con --no-commit nunca borra.
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/lib.sh"
+
+uso='uso: arc-close PLAN|.sdd/DIR [--abandon MOTIVO] [--close-spec] [--retro] [--no-commit]'
+target=""; abandon=""; close_spec=""; retro=""; no_commit=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --abandon) shift; abandon="${1:-}"; [ -n "$abandon" ] || die "--abandon exige un motivo" ;;
+        --close-spec) close_spec=1 ;;
+        --retro) retro=1 ;;
+        --no-commit) no_commit=1 ;;
+        -*) die "opción desconocida: $1 — $uso" ;;
+        *) [ -z "$target" ] || die "un solo PLAN por corrida — $uso"; target="$1" ;;
+    esac
+    shift
+done
+[ -n "$target" ] || die "$uso"
+
+root=$(root_dir); cd "$root" || die "no se pudo entrar a $root"
+hoy=$(date +%F)
+
+# Cosecha = progress + reports, nunca los diffs de review (99% del peso, cero valor fuera de su sesión).
+# progress.md ES la cosecha: si no se pudo copiar se muere ahí, con el ledger todavía intacto (el glob de reports sí tolera venir vacío).
+cosecha() {   # cosecha LEDGER DST LÍNEA-ARCO
+    mkdir -p "$2" || die "no se pudo crear $2"
+    [ ! -d "$1" ] || cp "$1"/progress.md "$2"/ || die "no se pudo copiar progress.md — ledger intacto, nada borrado"
+    [ ! -d "$1" ] || cp "$1"/task-*-report.md "$2"/ 2>/dev/null
+    printf '%s\n' "$3" >> "$2/progress.md" || die "no se pudo escribir $2/progress.md"
+}
+
+# REGLA PROPIA DE ESTE REPO (spec §10). El repo es PÚBLICO: lo que se cosecha se publica al
+# instante. Un ledger real está lleno de rutas /home, puertos de backends y nombres de unidad
+# de producción, y hasta acá nada lo vigilaba (en el lenguaje la guarda equivalente miraba solo
+# los briefs). Se corre ANTES de escribir: un cierre que fuera a publicar una ruta de máquina
+# falla con el ledger intacto, en vez de dejar el dato en la historia de git para siempre.
+# Mismo vocabulario que state-check (j): se permite ~/nyx/… y /tmp/<archivo> suelto.
+sin_rutas_de_maquina() {   # sin_rutas_de_maquina LEDGER
+    local f hit rc=0
+    for f in "$1"/progress.md "$1"/task-*-report.md; do
+        [ -f "$f" ] || continue
+        hit=$(grep -oIE '/tmp/claude-[0-9]+|/home/[a-z][a-z0-9_-]*|/mnt/[a-z]/|[A-Za-z]:\\' "$f" 2>/dev/null | head -1)
+        [ -n "$hit" ] && { printf 'sdd: %s cita una ruta de máquina («%s») y la cosecha se PUBLICA — reescribila como ~/nyx/… antes de cerrar\n' "$f" "$hit" >&2; rc=1; }
+    done
+    return $rc
+}
+
+# --- Modo cosecha retro de un ledger SIN plan. No exige rama ni árbol limpio ni toca banners. ---
+if [ -d "$target" ]; then
+    [ -n "$retro" ] || die "$target es un directorio: la cosecha de un ledger sin plan exige --retro"
+    # Sin estos tres guards `--retro .sdd/` cosecharía un stub y haría rm -rf de TODOS los ledgers, y `--retro docs/` borraría docs/. Ledger = dir de nombre PLANO bajo .sdd/, con progress.md.
+    target="${target%/}"; base=$(basename "$target"); abs=$(cd "$target" 2>/dev/null && pwd -P)
+    [ -f "$target/progress.md" ] || die "no es un ledger: falta $target/progress.md"
+    printf '%s' "$base" | grep -qE '^[A-Za-z0-9._-]+$' && [ "$base" != "." ] && [ "$base" != ".." ] \
+        || die "no es un ledger: «$base» no es un nombre de directorio plano"
+    [ "$abs" = "$(cd "$root" && pwd -P)/.sdd/$base" ] \
+        || die "no es un ledger: $target no cuelga de $root/.sdd/"
+    dst="docs/archive/sdd/$base"
+    [ -d "$dst" ] && die "ya cosechado: $dst (la cosecha es inmutable)"
+    sin_rutas_de_maquina "$target" || die "la cosecha se publicaría con rutas de máquina: nada escrito"
+    cosecha "$target" "$dst" "Arco: COSECHA RETRO ($hoy)"
+    git add "$dst" >/dev/null 2>&1
+    [ -n "$no_commit" ] && { printf 'preparado (sin commit, ledger intacto): %s\n' "$dst"; exit 0; }
+    git commit -q -m "docs(sdd): cosecha retro del ledger $base a $dst" -- "$dst" \
+        || die "commit falló"   # acotado a $dst: este modo no exige árbol limpio
+    rm -rf "$abs"   # ruta ya verificada como $(raíz)/.sdd/<nombre plano>
+    printf 'cosechado: %s (ledger borrado)\n' "$dst"
+    exit 0
+fi
+
+# --- Precondiciones ---
+plan="$target"
+[ -f "$plan" ] || die "plan no encontrado: $plan"
+plan=$(rel_path "$plan")   # ./docs/…, ruta absoluta y docs/… son el MISMO plan (línea de identidad)
+rama=$(git branch --show-current 2>/dev/null)
+[ "$rama" = "main" ] || die "arc-close corre en main (rama actual: «${rama:-?}»)"
+[ -z "$(git status --porcelain)" ] || die "árbol sucio: el cierre commitea, no arrastra cambios ajenos"
+estado_previo=$(banner_of "$plan")
+# Un BORRADOR no se cierra: no llegó a abrirse. El mensaje lo dice explícito porque el camino
+# de salida es otro (pedir el GO, o borrar el archivo), no el que sugiere «no está VIGENTE».
+[ -n "$retro" ] || [ "$estado_previo" != "BORRADOR" ] \
+    || die "el plan está en BORRADOR: un arco sin GO no se cierra — pedile el GO a Ottavio (banner a VIGENTE con «GO Ottavio <fecha>, modo <sdd|manual>») o borrá el borrador: $plan"
+[ -n "$retro" ] || [ "$estado_previo" = "VIGENTE" ] || die "el plan no está VIGENTE: $plan (estado «${estado_previo:-sin banner}»)"
+led=$(ledger_dir "$plan"); slug=$(slug_of "$plan"); base=$(base_of "$plan")
+[ -d "$led" ] || [ -n "$retro$abandon" ] || die "sin ledger: $led"
+
+# --- Validaciones (un arco no cierra a medias). --retro y --abandon las saltan ---
+if [ -z "$retro$abandon" ]; then
+    prog="$led/progress.md"
+    [ "$(head -1 "$prog" 2>/dev/null)" = "# SDD ledger — plan: $plan" ] || die "el ledger no es de este plan: $prog"
+    for n in $(awk '/^```/ { f = !f; next }
+                    !f && /^#+[ \t]+Task[ \t]+[0-9]+/ { t = $0; sub(/^#+[ \t]+Task[ \t]+/, "", t)
+                                                        sub(/[^0-9].*$/, "", t); print t }' "$plan"); do
+        grep -qE "^Task $n: (complete|skipped)" "$prog" || die "Task $n sin «complete» ni «skipped» en el ledger"
+        grep -qE "^Task $n: complete" "$prog" || continue
+        awk -v n="$n" '$0 ~ "^Task " n ": review" { r = 1 }
+                       $0 ~ "^Task " n ": complete" { exit (r ? 0 : 1) }' "$prog" \
+            || die "Task $n: «complete» sin «review» previa en el ledger"
+        [ -f "$led/task-$n-report.md" ] || [ -f "docs/design/briefs/$base/task-$n-report.md" ] || die "Task $n sin report (ni en el ledger ni en docs/design/briefs/$base/)"
+    done
+    awk '/^## Global Constraints/ { f = 1; next } /^##+ / { f = 0 } f' "$plan" | grep -q 'Gate humano de merge: sí' && ! grep -q '^Merge: autorizado por Ottavio' "$prog" \
+        && die "el plan exige gate de merge: falta «Merge: autorizado por Ottavio <fecha>» en el ledger"
+    # PORTE: el CHANGELOG de este repo NO usa «## [Unreleased]» / «## [0.4.3]» sino
+    # «## v0.4.3 — 2026-09-15». El awk del lenguaje (/^## \[/) no matchea NADA acá, así que
+    # esta validación habría fallado en el 100% de los cierres. Se acepta cualquiera de las dos
+    # formas. La etiqueta vale en un bloque publicado: se releasea por feature, con arcos
+    # todavía abiertos, y el bullet no retrocede por cerrar tarde. Lo que se exige es que el
+    # CHANGELOG narre el arco en algún bloque de versión, no en cuál.
+    awk '/^## (\[|v[0-9])/ { f = 1 } f' CHANGELOG.md | grep -qF "[arco: $slug]" \
+        || die "CHANGELOG.md sin la etiqueta «[arco: $slug]» en ningún bloque de versión"
+    # PORTE: acá NO se valida docs/SESSION_LOG.md (no existe: en este repo el CHANGELOG ES la
+    # bitácora, es narrativo y explica el porqué de cada cambio) ni PROJECT_STATE.md (vive
+    # fuera del repo, en ~/nyx/ops/proxy/, y grepear fuera del árbol rompería el fixture).
+    # Lo que sí se conserva es la disciplina de sacar el arco de la doc de arcos vivos:
+    grep -qF "$base.md" docs/design/ROADMAP.md 2>/dev/null \
+        && die "el arco sigue citado en docs/design/ROADMAP.md: se saca de los arcos vivos antes de cerrar"
+    sin_rutas_de_maquina "$led" || die "la cosecha se publicaría con rutas de máquina: nada escrito"
+fi
+
+# Validación final (también con --retro/--abandon): si el spec del mismo slug sigue VIGENTE y
+# nadie lo cita —ni la doc raíz ni, un nivel, otro plan VIGENTE que la raíz sí cite: la
+# transitiva de state-check (b)— el cierre lo dejaría rojo en [sdd.b] DESPUÉS de escribir. Se
+# caza antes.
+# OJO, divergencia DELIBERADA con state-check:root_cites, heredada del original (allá era
+# PLAN.md): acá se omite docs/design/ROADMAP.md a propósito, porque la validación de arriba
+# exige que el arco YA no esté ahí. Incluirlo haría que la cita que acabamos de obligar a
+# borrar sea la que salva al spec, y el rojo aparecería igual después de escribir.
+cita_raiz() { grep -lF -- "$1" README.md AGENTS.md CAPABILITIES.md CHANGELOG.md 2>/dev/null | grep -q .; }
+if [ -z "$close_spec" ]; then
+    for f in docs/design/specs/*-"$slug"-design.md; do
+        [ -f "$f" ] && [ "$(banner_of "$f")" = "VIGENTE" ] || continue
+        b=$(basename "$f"); cita_raiz "$b" && continue
+        for p in docs/design/plans/*.md; do
+            [ -f "$p" ] && [ "$p" != "$plan" ] && [ "$(banner_of "$p")" = "VIGENTE" ] \
+                && cita_raiz "$(basename "$p")" && grep -qF -- "$b" "$p" && { b=""; break; }
+        done
+        [ -z "$b" ] || die "el spec $f quedaría VIGENTE sin cita viva: usá --close-spec o citalo antes de cerrar"
+    done
+fi
+
+# --- Acciones (a partir de acá se escribe) ---
+dst="docs/archive/sdd/$base"
+[ -d "$dst" ] && die "ya existe la cosecha: $dst (la cosecha es inmutable)"
+estado=COMPLETO; nota="cerrado $hoy, cosecha en $dst/"
+[ -n "$abandon" ] && { estado=ABANDONADO; nota="$abandon (Ottavio, $hoy)"; }
+linea="Arco: $estado ($(git rev-parse --short=7 HEAD 2>/dev/null), $hoy)"
+[ -z "$retro" ] || linea="Arco: COSECHA RETRO ($hoy)"
+cosecha "$led" "$dst" "$linea"
+if [ -d "docs/design/briefs/$base" ]; then
+    git mv "docs/design/briefs/$base" "$dst/briefs" 2>/dev/null \
+        || mv "docs/design/briefs/$base" "$dst/briefs" \
+        || die "no se pudo mover los encargos; el ledger está intacto y los encargos siguen en su lugar; para reintentar: rm -rf $dst"
+fi
+# Con --retro el banner solo avanza si seguía VIGENTE (un arco histórico ya cerrado no cambia).
+if [ -z "$retro" ] || [ "$estado_previo" = "VIGENTE" ]; then
+    banner_set "$plan" "> **ESTADO: $estado** — $nota"
+fi
+spec=""
+if [ -n "$close_spec" ]; then
+    spec=$(ls docs/design/specs/*-"$slug"-design.md 2>/dev/null | head -1)
+    [ -z "$spec" ] || banner_set "$spec" "> **ESTADO: $estado** — $nota"
+fi
+
+reintento="para reintentar: git restore --staged . && git checkout -- . && rm -rf $dst"
+bash "$SELF_DIR/index-gen" >/dev/null \
+    || die "index-gen falló (¿INDEX sin marcadores <!-- index:begin/end -->?) — el ledger está intacto; $reintento"
+# PORTE: el lenguaje llama acá a scripts/testing/run_docs_health.sh, que este repo no tiene.
+# En vez de portar un runner entero para envolver dos llamadas, se invocan las dos guardas
+# directas — que son exactamente los checks 8 y 11 de aquel.
+bash "$SELF_DIR/index-gen" --check >/dev/null \
+    || die "el INDEX quedó desfasado — el ledger está intacto; $reintento"
+bash "$SELF_DIR/state-check" \
+    || die "state-check rojo: no se cierra — el ledger está intacto; $reintento"
+
+git add "$dst" "$plan" docs/design/INDEX.md >/dev/null 2>&1
+[ -z "$spec" ] || git add "$spec" >/dev/null 2>&1
+[ -d docs/design/briefs ] && git add docs/design/briefs >/dev/null 2>&1
+[ -n "$no_commit" ] && { printf 'preparado (sin commit, ledger intacto): %s\n' "$dst"; exit 0; }
+git commit -q -m "docs(sdd): cierre del arco $slug — cosecha del ledger a $dst, banner $estado, INDEX regenerado" || die "commit falló"
+rm -rf "$led"   # ÚLTIMO paso, y solo después de un commit exitoso
+printf 'arco %s cerrado: %s (banner %s, ledger borrado)\n' "$slug" "$dst" "$estado"

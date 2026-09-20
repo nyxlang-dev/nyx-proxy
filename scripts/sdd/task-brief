@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# scripts/sdd/task-brief PLAN N [OUT] — extrae el bloque «### Task N: ...» del plan al ledger.
+# Reemplaza al task-brief del plugin superpowers conservando su contrato y su regex de
+# heading: ^#+[ \t]+Task[ \t]+N([^0-9]|$). El bloque va desde ese heading hasta el siguiente
+# heading de igual o mayor nivel (o hasta el siguiente heading de task, sea cual sea su
+# nivel), respetando los fences ``` — un `### Task 9` DENTRO de un bloque de código es texto
+# del brief, no una task, y confundirlos fue lo que produjo el task-1-brief.md de 0 bytes
+# citado en el spec. Exit 3 si la task no existe (el archivo vacío no se deja en disco).
+# Por defecto escribe en .sdd/<plan-basename>/task-N-brief.md e imprime esa ruta.
+set -u
+. "$(dirname "$0")/lib.sh"
+
+plan="${1:?uso: task-brief PLAN N [OUT]}"
+n="${2:?uso: task-brief PLAN N [OUT]}"
+[ -f "$plan" ] || die "plan no encontrado: $plan"
+out="${3:-$(ledger_dir "$plan")/task-$n-brief.md}"
+mkdir -p "$(dirname "$out")" || die "no se pudo crear $(dirname "$out")"
+
+awk -v n="$n" '
+  /^```/ { infence = !infence }
+  !infence && /^#+[ \t]/ {
+    match($0, /^#+/); lvl = RLENGTH
+    if (intask && (lvl <= tasklvl || $0 ~ /^#+[ \t]+Task[ \t]+[0-9]+/)) exit
+    if (!intask && $0 ~ ("^#+[ \t]+Task[ \t]+" n "([^0-9]|$)")) { intask = 1; tasklvl = lvl }
+  }
+  intask { print }
+' "$plan" > "$out"
+
+if [ ! -s "$out" ]; then
+    rm -f "$out"
+    printf 'task %s no encontrada en %s\n' "$n" "$plan" >&2
+    exit 3
+fi
+printf '%s\n' "$out"

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# scripts/sdd/index-gen [--check] — regenera la tabla de docs/design/INDEX.md (spec §2).
+# El INDEX es GENERADO: la tabla entre <!-- index:begin --> y <!-- index:end --> sale de los
+# banners de los propios archivos, así que no puede mentir sobre el estado de un arco (que
+# es exactamente lo que pasaba cuando se mantenía a mano). Todo lo demás del INDEX —
+# leyenda, notas de clasificación — es manual y no se toca.
+# Una fila por archivo de plans/ specs/ spikes/ y una por CARPETA de reviews/ y de briefs/
+# (los repros son decenas de archivos, y los encargos de un arco son N task-*.md, sin valor
+# individual en un índice). Los .md SUELTOS de reviews/ también llevan fila propia: en el
+# repo del lenguaje no la llevaban y por eso un review suelto quedaba fuera del índice sin
+# que ninguna guarda lo cazara. `--check` es la guarda: genera a un temporal y falla con
+# `diff -u` si el INDEX commiteado quedó desfasado.
+set -u
+. "$(dirname "$0")/lib.sh"
+
+mode="${1:-}"
+case "$mode" in ''|--check) ;; *) die "uso: index-gen [--check]" ;; esac
+
+root=$(root_dir); cd "$root" || die "no se pudo entrar a $root"
+idx="docs/design/INDEX.md"
+[ -f "$idx" ] || die "no existe $idx"
+grep -qF '<!-- index:begin -->' "$idx" && grep -qF '<!-- index:end -->' "$idx" \
+    || die "INDEX sin marcadores <!-- index:begin/end -->"
+
+tbl=$(mktemp) || die "mktemp falló"
+new=$(mktemp) || die "mktemp falló"
+trap 'rm -f "$tbl" "$new"' EXIT
+
+# «Referenciado por» = quién cita este artefacto desde la doc raíz. La lista es la de ESTE
+# repo, no la del lenguaje: acá no hay PLAN.md ni PROJECT_STATE.md (el estado del proxy vive
+# fuera del repo, en ~/nyx/ops/proxy/). docs/design/ROADMAP.md entra a propósito aunque esté
+# dentro de design/: es la doc raíz de arcos vivos, el equivalente local de PLAN.md, y sin
+# ella un VIGENTE de referencia no tendría de dónde colgarse (regla (b) de state-check).
+refs_of() {
+    local hits
+    hits=$(grep -lF -- "$1" README.md AGENTS.md CAPABILITIES.md CHANGELOG.md \
+        docs/design/ROADMAP.md docs/*.md 2>/dev/null \
+        | LC_ALL=C sort -u | sed 's/.*/`&`/' | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    [ -n "$hits" ] && printf '%s' "$hits" || printf '—'
+}
+
+row() {
+    local f="$1" b tipo fecha estado nota
+    b=$(basename "$f")
+    case "$f" in
+        docs/design/reviews/*)
+            # carpeta de repros vs .md suelto: el suelto lleva «review» en singular
+            if [ -d "$f" ]; then tipo="reviews"; else tipo="review"; fi
+            estado="—"; nota="—" ;;
+        docs/design/briefs/*) tipo="briefs"; estado="—"; nota="—" ;;
+        *)
+            tipo=$(basename "$(dirname "$f")"); tipo="${tipo%s}"
+            case "$f" in
+                *.patch) estado="—"; nota="—" ;;
+                *) estado=$(banner_of "$f"); nota=$(banner_suffix "$f") ;;
+            esac ;;
+    esac
+    case "$b" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) fecha="${b:0:10}" ;;
+        *) fecha="—" ;;
+    esac
+    [ -n "$estado" ] || estado="—"
+    [ -n "$nota" ] || nota="—"
+    nota="${nota//|/\\|}"
+    printf '| `%s` | %s | %s | %s | %s | %s |\n' "$f" "$fecha" "$tipo" "$estado" "$nota" "$(refs_of "$b")"
+}
+
+{
+    printf '| Archivo | Fecha | Tipo | Estado | Nota | Referenciado por |\n'
+    printf '|---|---|---|---|---|---|\n'
+    {
+        for d in plans specs spikes; do
+            [ -d "docs/design/$d" ] && find "docs/design/$d" -maxdepth 1 -type f
+        done
+        for d in reviews briefs; do
+            [ -d "docs/design/$d" ] && find "docs/design/$d" -mindepth 1 -maxdepth 1 -type d
+        done
+        [ -d docs/design/reviews ] && find docs/design/reviews -maxdepth 1 -type f -name '*.md'
+    } | LC_ALL=C sort | while IFS= read -r f; do [ -n "$f" ] && row "$f"; done
+} > "$tbl"
+
+awk -v tbl="$tbl" '
+  /<!-- index:begin -->/ { print; while ((getline line < tbl) > 0) print line; skip=1; next }
+  /<!-- index:end -->/   { skip=0 }
+  !skip { print }
+' "$idx" > "$new" || die "no se pudo generar el INDEX"
+
+if [ "$mode" = "--check" ]; then
+    if diff -u "$idx" "$new"; then
+        printf '✓ index-gen: %s al día\n' "$idx"
+        exit 0
+    fi
+    printf '  ✗ [index] %s difiere del generado — correr scripts/sdd/index-gen\n' "$idx" >&2
+    exit 1
+fi
+cp "$new" "$idx" || die "no se pudo escribir $idx"
+printf '%s: %s filas\n' "$idx" "$(( $(wc -l < "$tbl") - 2 ))"

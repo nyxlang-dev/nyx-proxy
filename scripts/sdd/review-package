@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# scripts/sdd/review-package PLAN BASE HEAD [OUT] — paquete de review de una task.
+# Escribe commits + `--stat` + diff `-U10` en UN archivo que el reviewer lee de una sola
+# llamada, y termina con la línea `stats: files=N net=M` (M = insertadas − borradas), que
+# también va a stdout: es el dato que decide si aplica «review light» (spec §4: ≤3 archivos
+# y ≤80 líneas netas, y sin tocar src/router.nx ni src/cache.nx — el corazón del proxy: el
+# pool y el encuadre viven en el primero, el slicing por bytes en el segundo). Reemplaza al
+# plugin superpowers; el rango se toma con la BASE registrada de la task, no HEAD~1, para
+# que una task de varios commits llegue entera al reviewer.
+# La ruta del archivo va a stderr para no ensuciar el stdout que consume el coordinador.
+set -u
+. "$(dirname "$0")/lib.sh"
+
+plan="${1:?uso: review-package PLAN BASE HEAD [OUT]}"
+base="${2:?uso: review-package PLAN BASE HEAD [OUT]}"
+head="${3:?uso: review-package PLAN BASE HEAD [OUT]}"
+[ -f "$plan" ] || die "plan no encontrado: $plan"
+git rev-parse --verify --quiet "$base" >/dev/null || die "BASE inválida: $base"
+git rev-parse --verify --quiet "$head" >/dev/null || die "HEAD inválido: $head"
+
+b7=$(git rev-parse --short=7 "$base")
+h7=$(git rev-parse --short=7 "$head")
+out="${4:-$(ledger_dir "$plan")/review-$b7..$h7.diff}"
+mkdir -p "$(dirname "$out")" || die "no se pudo crear $(dirname "$out")"
+
+{
+    printf '## Commits %s..%s\n\n' "$b7" "$h7"
+    git log --oneline "$base..$head"
+    printf '\n## Files\n\n'
+    git diff --stat "$base" "$head"
+    printf '\n## Diff\n\n'
+    git diff -U10 "$base" "$head"
+} > "$out"
+
+files=$(git diff --name-only "$base" "$head" | wc -l | tr -d ' ')
+# Los binarios reportan «-» en numstat; awk los evalúa como 0, que es lo correcto acá.
+net=$(git diff --numstat "$base" "$head" | awk '{a+=$1; d+=$2} END {print a-d}')
+printf 'stats: files=%s net=%s\n' "$files" "$net" | tee -a "$out"
+printf '%s\n' "$out" >&2

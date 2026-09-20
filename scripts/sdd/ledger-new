@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# scripts/sdd/ledger-new PLAN — crea el ledger de ejecución de un plan (spec §4).
+# Escribe .sdd/<plan-basename>/progress.md con la LÍNEA DE IDENTIDAD como línea 1
+# («# SDD ledger — plan: <ruta>»): un ledger que nombra otro plan es de otro plan y no se
+# toca. Deja el «## Pre-flight» con la tabla vacía porque el pre-flight es lo primero que
+# se llena y lo primero que se olvida cuando no está el encabezado puesto.
+# Y siembra el CHECKLIST DE MARCAS, una línea por `### Task N` del plan, por el mismo motivo
+# llevado al cierre: las marcas `Task N: review`/`Task N: complete` y los `task-N-report.md`
+# que `arc-close` exige se descubrían recién AL CERRAR, cuando los ejecutores ya no están y
+# el cierre lo termina firmando quien no hizo el trabajo (pasó con nyx-test-cobertura y con
+# http-tls-cliente, los dos el 2026-09-17). Sembrarlas pendientes las pone a la vista desde
+# el primer día. El checklist es recordatorio: lo que el cierre lee son las líneas ancladas,
+# y por eso las del ejemplo van indentadas — no deben matchear `^Task N:`.
+# Imprime la ruta absoluta del progress.md creado. Exit 2 si ya existe: reemplaza al
+# `sdd-workspace` del plugin superpowers, que era idempotente y por eso podía dejar que una
+# sesión nueva escribiera sobre el ledger de la anterior sin avisar.
+set -u
+. "$(dirname "$0")/lib.sh"
+
+plan="${1:?uso: ledger-new PLAN}"
+[ -f "$plan" ] || die "plan no encontrado: $plan"
+
+dir=$(ledger_dir "$plan")
+prog="$dir/progress.md"
+if [ -e "$prog" ]; then
+    printf 'sdd: el ledger ya existe: %s\n' "$prog" >&2
+    exit 2
+fi
+
+# Ruta del plan relativa a la raíz del repo (la línea de identidad debe ser estable
+# independientemente del cwd desde el que se invoque el script). El mismo helper lo usa
+# arc-close para comparar: una sola definición de «qué ruta es este plan».
+rel=$(rel_path "$plan")
+
+# Números y títulos de las tasks, con el MISMO patrón de heading que task-brief y arc-close
+# (y respetando los fences: un «### Task 9» dentro de ``` es texto del plan, no una task).
+# Una sola definición de «qué es una task» — divergir acá sembraría un checklist que no
+# corresponde con lo que el cierre valida.
+tasks=$(awk '
+  /^```/ { f = !f; next }
+  !f && /^#+[ \t]+Task[ \t]+[0-9]+/ {
+      t = $0; sub(/^#+[ \t]+Task[ \t]+/, "", t)
+      n = t; sub(/[^0-9].*$/, "", n)
+      sub(/^[0-9]+[ \t]*:?[ \t]*/, "", t)
+      printf "- [ ] Task %s — %s\n", n, t
+  }' "$plan")
+
+mkdir -p "$dir" || die "no se pudo crear $dir"
+{
+    printf '# SDD ledger — plan: %s\n' "$rel"
+    printf '\n'
+    printf '## Pre-flight\n'
+    printf '\n'
+    printf '| Par | Hallazgo |\n'
+    printf '|---|---|\n'
+    printf '\n'
+    printf '## Marcas por task — las exige `arc-close`, sin ellas el arco no cierra\n'
+    printf '\n'
+    if [ -n "$tasks" ]; then printf '%s\n' "$tasks"
+    else printf '_El plan todavía no declara `### Task N`: al escribirlas, una línea por task acá._\n'; fi
+    cat <<'TPL'
+
+Al terminar cada task van estas dos líneas, ANCLADAS a principio de línea (vocabulario de la
+spec §4). El checklist de arriba es el recordatorio; lo que el cierre lee son estas:
+
+    Task N: review <Approved|Approved-con-fix|light <archivos>/<líneas>> (<modelo|coordinador>)
+    Task N: complete (<sha7>..<sha7>)
+
+Y un `task-N-report.md` en este directorio por cada task completa. Una task que no se hace se
+cierra con `skipped` y su ruling, no se deja sin marca.
+TPL
+} > "$prog"
+
+printf '%s\n' "$prog"

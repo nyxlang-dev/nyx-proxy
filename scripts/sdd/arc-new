@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# scripts/sdd/arc-new SLUG (--spec|--plan) "Título" [--go] [--supersedes F] — siembra el
+# artefacto de diseño de un arco nuevo (spec §1 rutas, §2 banner, §3 plantilla, §7 gates).
+# Por qué un script y no una plantilla copiada a mano: el banner de la línea 1, el nombre con
+# fecha y la estructura del plan (`### Task N`, Global Constraints, Fuera de alcance /
+# Verificación E2E / Self-review) son CONTRATOS que verifican state-check y task-brief.
+# Sembrarlos a ojo fue lo que produjo los tres formatos de heading de task y los planes sin
+# banner que documenta el spec. Sin `--go` el arco nace en estado BORRADOR con sufijo «GO
+# pendiente»: se commitea y VIVE en main —así es como se aprueba, leyéndolo— pero sin los
+# derechos de un VIGENTE (no es campaña activa, no reparte encargos, no se cierra).
+# Imprime la ruta creada y regenera docs/design/INDEX.md.
+set -u
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$SELF_DIR/lib.sh"
+
+uso='uso: arc-new SLUG (--spec|--plan) "Título" [--go] [--supersedes ARCHIVO]'
+slug=""; titulo=""; kind=""; go=""; sup=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --spec|--plan) kind="${1#--}" ;;
+        --go) go=1 ;;
+        --supersedes) shift; sup="${1:-}"; [ -n "$sup" ] || die "--supersedes exige un archivo" ;;
+        -*) die "opción desconocida: $1 — $uso" ;;
+        *) if [ -z "$slug" ]; then slug="$1"; elif [ -z "$titulo" ]; then titulo="$1"
+           else die "argumento de más: $1 — $uso"; fi ;;
+    esac
+    shift
+done
+[ -n "$slug" ] && [ -n "$kind" ] && [ -n "$titulo" ] || die "$uso"
+printf '%s' "$slug" | grep -qE '^[a-z0-9-]+$' || die "slug inválido «$slug»: solo [a-z0-9-]"
+
+root=$(root_dir); cd "$root" || die "no se pudo entrar a $root"
+hoy=$(date +%F)
+if [ "$kind" = spec ]; then out="docs/design/specs/$hoy-$slug-design.md"
+else out="docs/design/plans/$hoy-$slug.md"; fi
+[ -e "$out" ] && die "ya existe: $out — un arco por slug y por día"
+mkdir -p "$(dirname "$out")" || die "no se pudo crear $(dirname "$out")"
+
+# Banner (spec §2 y §7): sin GO explícito el arco nace BORRADOR, no VIGENTE. El estado propio
+# es lo que le permite esperar la aprobación EN main sin poner la guarda en rojo; sembrarlo
+# VIGENTE obligaba a elegir entre no commitear el borrador o dejar docs-health rojo.
+if [ -n "$go" ] && [ "$kind" = plan ]; then banner="> **ESTADO: VIGENTE** — GO Ottavio $hoy, modo sdd"
+elif [ -n "$go" ]; then banner="> **ESTADO: VIGENTE** — GO Ottavio $hoy"
+else banner="> **ESTADO: BORRADOR** — GO pendiente"; fi
+
+if [ "$kind" = spec ]; then
+    { printf '%s\n\n# %s\n\n' "$banner" "$titulo"
+      cat <<'TPL'
+## Contexto
+
+## Decisión
+
+## Fuera de alcance
+
+## Riesgos
+TPL
+    } > "$out" || die "no se pudo escribir $out"
+else
+    specref='—'
+    [ -f "docs/design/specs/$hoy-$slug-design.md" ] && specref="\`docs/design/specs/$hoy-$slug-design.md\`"
+    { printf '%s\n\n# %s — Implementation Plan\n\n' "$banner" "$titulo"
+      cat <<'TPL'
+> **Para agentes:** los steps se siguen con checkbox (`- [ ]`), pero lo que el cierre lee no
+> es el checkbox sino las marcas ancladas del ledger, que siembra `scripts/sdd/ledger-new`.
+> El método no depende de ningún plugin: los scripts de `scripts/sdd/` se bastan solos.
+
+**Goal:**
+
+**Architecture:**
+
+**Tech Stack:**
+
+TPL
+      printf '**Spec:** %s\n\n' "$specref"
+      cat <<'TPL'
+## Global Constraints
+
+- La versión vive en `nyx.toml` y no se toca por mergear. Mergear ≠ releasear.
+- Gates por task: `make test-proxy` 100% + `make build` + `make sdd-check`.
+- Los subagentes NUNCA pushean ni mergean; sin sub-subagentes.
+- Gate humano de merge: no
+
+---
+
+### Task 1: 
+
+**Files:**
+- Create:
+- Modify:
+- Test:
+
+**Interfaces:**
+- Consumes:
+- Produces:
+
+- [ ] **Step 1:**
+
+## Fuera de alcance
+
+## Verificación E2E
+
+## Self-review
+TPL
+    } > "$out" || die "no se pudo escribir $out"
+fi
+
+# --supersedes: el reemplazado apunta al nuevo. state-check (c) exige que el destino exista
+# EN EL MISMO directorio, así que un spec solo puede superseder a un spec.
+if [ -n "$sup" ]; then
+    [ -f "$sup" ] || die "--supersedes: no existe $sup"
+    [ "$(cd "$(dirname "$sup")" && pwd -P)" = "$(cd "$(dirname "$out")" && pwd -P)" ] \
+        || die "--supersedes: $sup vive en otro directorio que $out (state-check (c) fallaría)"
+    tmp=$(mktemp) || die "mktemp falló"
+    { printf '> **ESTADO: SUPERSEDED por `%s`** — %s\n' "$(basename "$out")" "$hoy"
+      tail -n +2 "$sup"; } > "$tmp" && cp "$tmp" "$sup" || die "no se pudo actualizar $sup"
+    rm -f "$tmp"   # cp y no mv: mv le pasaría al documento los permisos 600 del temporal
+fi
+
+printf '%s\n' "$out"
+# El ledger NO se siembra acá: un plan recién nacido está en BORRADOR y todavía no declara sus
+# tasks, así que su ledger sería huérfano para state-check (h) y el checklist saldría vacío.
+# El paso va por stderr —el stdout es la ruta, que los scripts consumen— para que el siguiente
+# comando esté a la vista en vez de aprenderse de memoria.
+[ "$kind" = plan ] && printf 'sdd: tras el GO, `ledger-new %s` siembra el ledger con las marcas por task que exige el cierre\n' "$out" >&2
+bash "$SELF_DIR/index-gen" >/dev/null || die "$out quedó creado, pero index-gen falló (¿INDEX sin marcadores <!-- index:begin/end -->?)"

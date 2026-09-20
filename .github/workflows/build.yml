@@ -13,6 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Las guardas del método SDD corren primero: son bash puro, no necesitan el
+      # toolchain, y si el INDEX quedó desfasado o un documento publica una ruta de
+      # máquina conviene saberlo antes de gastar tres minutos instalando Nyx.
+      - name: SDD selftest and docs guards
+        run: |
+          make sdd-check
+          make docs-health
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
