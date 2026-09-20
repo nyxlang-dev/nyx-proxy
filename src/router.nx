@@ -119,6 +119,15 @@ fn sse_init() {
     // justo lo que el loop ya sabe manejar.
     // Medido: sin esta línea, el caso de tests/test_proxy_sse_tls.nx muere con
     // rc=141 (128+SIGPIPE) sin alcanzar a imprimir una sola línea.
+    //
+    // ESTO ES TEMPORAL Y SE RETIRA. El core ya tiene el arreglo de verdad (un
+    // BIO propio cuyo bwrite va por os_sock_send, con MSG_NOSIGNAL), y entonces
+    // esta línea sobra — y encima es lo que el propio core decidió NO hacer: una
+    // biblioteca no puede cambiarle la política de señales al proceso que la
+    // importa. El orden para sacarla está en docs/design/ROADMAP.md §Deuda con
+    // orden de ejecución; el paso que lo autoriza es correr
+    // tests/test_proxy_sse_tls.nx SIN su signal_ignore, contra un toolchain que
+    // ya traiga el BIO. Antes de eso, sacarla reabre el agujero en producción.
     signal_ignore(13)
     g_sse_mtx = mutex_new()
     g_sse_mtx_init = 1

@@ -28,6 +28,31 @@ lado la mencionaba.
 |---|---|---|
 | `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
 
+## Deuda con orden de ejecución: retirar la mitigación de SIGPIPE
+
+`signal_ignore(13)` está en dos lugares y es **temporal**. Lo puso v0.4.4 cuando se descubrió que
+un `tls_write_conn` contra un peer cerrado mataba el proceso (el runtime no instalaba `SIG_IGN`
+global y OpenSSL escribe con `write()` crudo). El core ya tiene el arreglo de verdad: un
+`BIO_METHOD` propio cuyo `bwrite` va por `os_sock_send` con `MSG_NOSIGNAL`.
+
+**El orden importa: retirarlo antes de tiempo reabre el agujero en producción.**
+
+1. El repo del lenguaje mergea el BIO y publica el toolchain (`make install-local`). *(fuera de
+   este repo; a la espera)*
+2. Recompilar **esta lib y el gateway contra ese toolchain**. Mientras el binario desplegado siga
+   enlazado con el runtime viejo, `signal_ignore(13)` es lo único que lo protege.
+3. Correr `tests/test_proxy_sse_tls.nx` **sin** el `signal_ignore` del caso. Si pasa, el BIO cubre
+   el agujero y recién ahí se retira la mitigación.
+
+Qué se retira y qué no:
+
+- **`sse_init()` en `src/router.nx` — SÍ, se retira.** Una biblioteca no puede cambiarle la política
+  de señales al proceso que la importa; es el mismo argumento por el que el core NO hizo un
+  `SIG_IGN` global.
+- **El arranque del gateway privado — opcional.** Ahí somos la *aplicación*, que es la única que
+  legítimamente decide ignorar una señal en su propio proceso. Como cinturón de seguridad no hace
+  daño, solo deja de ser necesario.
+
 ## Cómo se trabaja acá
 
 El método completo está en `docs/design/specs/2026-09-20-sdd-proxy-design.md` y los comandos en
