@@ -123,6 +123,21 @@ global de fds de listener, una fn-thread por caso que hace `tcp_accept`, drena e
 bytes crudos de respuesta. Puertos fijos fuera del rango efímero (19350+), uno por caso, y un
 índice de upstream distinto por caso para no compartir pool.
 
+**Un test que verifica la FORMA y no el VALOR pasa en verde sobre el bug que debería cazar.**
+Es el agujero que más caro salió acá, y no es una anécdota: tres bugs de la misma familia de
+escalas de tiempo sobrevivieron por eso. `test_proxy_metrics` llamaba a `metrics_record_request`
+con microsegundos correctos y verificaba que saliera un número — así que la función siempre estuvo
+verde mientras el caller le pasaba segundos, y el access log escribía `0ms` en todas sus líneas
+durante meses. La misma forma tenía un `signal(SIGPIPE, SIG_IGN)` en la suite de TLS del runtime,
+puesto con el comentario «es benigno para el test»: un test que se protege de la señal no puede
+ver el bug que la señal causa.
+
+La regla: cuando un test comprueba que *hay* un valor, que el proceso *sigue vivo*, o que el
+formato *es el esperado*, preguntate qué versión rota seguiría pasando. Si la respuesta es «una
+que importa», el test tiene que medir el número, la señal o el tiempo — no su envoltorio. Los
+casos del túnel SSE están escritos así a propósito: miden que la pausa del upstream se *preserve*,
+no que los eventos *lleguen*.
+
 **El toolchain es compartido y eso puede corromper una corrida.** `run_unit_tests.sh` copia cada
 suite a `$NYX_HOME/script.nx`, que es un archivo ÚNICO en el repo del lenguaje. Si hay otra sesión
 compilando ahí —cosa que pasa— tu corrida puede terminar ejecutando el binario de otro test, sin
