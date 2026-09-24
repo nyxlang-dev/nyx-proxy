@@ -22,7 +22,7 @@ STACK="$(cd "$(dirname "$0")/.." && pwd)"
 NYX_HOME="${NYX_HOME:-/home/admin/nyx/lang}"
 export NYX_HOME
 cd "$STACK"
-TESTS="test_proxy_cache test_proxy_metrics test_proxy_xff test_proxy_retry test_proxy_config_listen test_proxy_time test_proxy_pool_framing test_proxy_sse_tunnel test_proxy_sse_tls"
+TESTS="test_proxy_cache test_proxy_metrics test_proxy_xff test_proxy_retry test_proxy_config_listen test_proxy_time test_proxy_pool_framing test_proxy_sse_tunnel test_proxy_sse_tls test_proxy_fwd_headers"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/nyx-proxy-tests.XXXXXX")" || { echo "FAIL: mktemp"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT

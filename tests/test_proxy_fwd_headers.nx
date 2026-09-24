@@ -1,0 +1,217 @@
+// test_proxy_fwd_headers.nx — Qué cabeceras le llegan al upstream (2026-09-24).
+//
+// El encargo vino de nyxerp, que abría su punto de venta detrás del gateway y
+// tenía el login en 403: compara el Origin con X-Forwarded-Host/Host, y el
+// proxy no le daba ni lo uno ni lo otro.
+//
+//   · Host se reescribe a `backend.host:port` y NO se mandaba X-Forwarded-Host:
+//     el backend no tenía cómo saber su dominio público.
+//   · X-Forwarded-Proto iba FIJO en `http`, aunque el cliente hubiera entrado
+//     por TLS. Silencioso: cookies Secure y URLs absolutas del backend mal.
+//   · Host se omitía comparando `hk != "Host"`: un `host` en minúsculas llegaba
+//     DUPLICADO al upstream (y el vhost no lo encontraba).
+//   · Las X-Forwarded-Host/Proto que mandaba el cliente pasaban tal cual.
+//   · El Content-Length del cliente llegaba duplicado con el del router.
+//
+// Cada caso mira el VALOR que recibe un upstream real, no la forma: el upstream
+// falso devuelve como cuerpo las cabeceras que le llegaron, byte a byte.
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/metrics"
+
+let PUERTO_ECO: int = 19400
+// Nadie escucha acá: es el upstream por defecto, y caer en él da 502.
+let PUERTO_MUERTO: int = 19401
+let VHOST: String = "pos.nyxerp.test"
+
+// Pedidos que el upstream eco atiende en total (uno por caso que llega a él).
+let PEDIDOS_ECO: int = 7
+
+var g_srv_eco: Array = [0]
+
+// Upstream eco: responde a cada pedido con su bloque de cabeceras crudo (request
+// line incluida) como cuerpo. Atiende varios pedidos por conexión porque el
+// router devuelve el fd al pool, y acepta otra si el router abre una nueva.
+fn up_eco() -> int {
+    var servidos: int = 0
+    while servidos < PEDIDOS_ECO {
+        let c: int = tcp_accept(g_srv_eco[0])
+        var viva: int = 1
+        while viva == 1 and servidos < PEDIDOS_ECO {
+            var bloque: String = ""
+            var largo_cuerpo: int = 0
+            var fin: int = 0
+            var primera: int = 1
+            while fin == 0 {
+                let linea: String = tcp_read_line(c)
+                if linea.length() == 0 {
+                    fin = 1
+                    if primera == 1 {
+                        viva = 0
+                    }
+                } else {
+                    bloque = bloque + linea + "\n"
+                    let baja: String = linea.toLower()
+                    if baja.startsWith("content-length:") and largo_cuerpo == 0 {
+                        largo_cuerpo = string_to_int(linea.substring(15, str_byte_length(linea)).trim())
+                    }
+                }
+                primera = 0
+            }
+            if viva == 1 {
+                if largo_cuerpo > 0 {
+                    let cuerpo: String = tcp_read(c, largo_cuerpo)
+                }
+                var resp: String = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                resp = resp + "Content-Length: " + int_to_string(str_byte_length(bloque)) + "\r\n\r\n" + bloque
+                tcp_write(c, resp)
+                servidos = servidos + 1
+            }
+        }
+        tcp_close(c)
+    }
+    return 0
+}
+
+// Cuerpo de la respuesta del proxy = lo que recibió el upstream.
+fn recibido(resp: String) -> String {
+    let sep: int = resp.indexOf("\r\n\r\n")
+    if sep < 0 { return "" }
+    return resp.substring(sep + 4, str_byte_length(resp))
+}
+
+// Cuántas líneas del bloque son la cabecera `nombre` (sin mayúsculas).
+fn cuantas(bloque: String, nombre: String) -> int {
+    let lineas: Array = bloque.split("\n")
+    let marca: String = nombre.toLower() + ":"
+    var n: int = 0
+    var i: int = 0
+    while i < lineas.length() {
+        let l: String = lineas[i]
+        if l.toLower().startsWith(marca) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Valor de la primera línea de la cabecera `nombre` (sin mayúsculas).
+fn valor(bloque: String, nombre: String) -> String {
+    let lineas: Array = bloque.split("\n")
+    let marca: String = nombre.toLower() + ":"
+    var i: int = 0
+    while i < lineas.length() {
+        let l: String = lineas[i]
+        if l.toLower().startsWith(marca) {
+            return l.substring(str_byte_length(marca), str_byte_length(l)).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn pedir(ssl_handle: int, metodo: String, headers: Array, cuerpo: String) -> String {
+    let req: Array = ["request", metodo, "/login", headers, cuerpo]
+    let resp: String = proxy_dispatch_c(req, ssl_handle, -1)
+    assert(resp.indexOf("HTTP/1.1 200") == 0, "el pedido llega al upstream eco (" + resp.substring(0, 12) + ")")
+    return recibido(resp)
+}
+
+fn test_host_original_va_en_x_forwarded_host() {
+    let b: String = pedir(0, "GET", ["Host", VHOST, "Accept", "*/*"], "")
+    assert(valor(b, "X-Forwarded-Host") == VHOST, "X-Forwarded-Host = Host original del cliente")
+    assert(cuantas(b, "X-Forwarded-Host") == 1, "un solo X-Forwarded-Host")
+    // El Host al backend sigue siendo el del backend: eso no cambió.
+    assert(cuantas(b, "Host") == 1, "un solo Host")
+    assert(valor(b, "Host") == "127.0.0.1:" + int_to_string(PUERTO_ECO), "Host = backend.host:port")
+    assert(valor(b, "Accept") == "*/*", "el resto de las cabeceras pasa")
+    print("PASS fwd: el Host original del cliente llega como X-Forwarded-Host")
+}
+
+fn test_host_con_puerto_se_conserva_entero() {
+    let b: String = pedir(0, "GET", ["Host", VHOST + ":8443"], "")
+    assert(valor(b, "X-Forwarded-Host") == VHOST + ":8443", "X-Forwarded-Host lleva el puerto si el cliente lo mandó")
+    print("PASS fwd: X-Forwarded-Host conserva el puerto del Host original")
+}
+
+fn test_listener_plano_manda_proto_http() {
+    let b: String = pedir(0, "GET", ["Host", VHOST], "")
+    assert(valor(b, "X-Forwarded-Proto") == "http", "listener plano ⇒ X-Forwarded-Proto: http")
+    assert(cuantas(b, "X-Forwarded-Proto") == 1, "un solo X-Forwarded-Proto")
+    print("PASS fwd: listener plano ⇒ X-Forwarded-Proto: http")
+}
+
+// ssl_handle > 0 es la convención del sink para «el cliente entró por TLS». El
+// handle no se toca mientras la respuesta no sea un SSE, y la del eco no lo es.
+fn test_listener_tls_manda_proto_https() {
+    let b: String = pedir(1, "GET", ["Host", VHOST], "")
+    assert(valor(b, "X-Forwarded-Proto") == "https", "listener TLS ⇒ X-Forwarded-Proto: https (antes: http fijo)")
+    assert(cuantas(b, "X-Forwarded-Proto") == 1, "un solo X-Forwarded-Proto")
+    print("PASS fwd: listener TLS ⇒ X-Forwarded-Proto: https")
+}
+
+fn test_x_forwarded_del_cliente_se_descartan() {
+    let h: Array = ["Host", VHOST, "X-Forwarded-Host", "evil.test", "x-forwarded-proto", "https",
+                    "X-FORWARDED-HOST", "evil2.test"]
+    let b: String = pedir(0, "GET", h, "")
+    assert(cuantas(b, "X-Forwarded-Host") == 1, "los X-Forwarded-Host del cliente no pasan")
+    assert(valor(b, "X-Forwarded-Host") == VHOST, "X-Forwarded-Host es el Host real, no el falso")
+    assert(cuantas(b, "X-Forwarded-Proto") == 1, "el X-Forwarded-Proto del cliente no pasa")
+    assert(valor(b, "X-Forwarded-Proto") == "http", "un cliente plano no puede declararse https")
+    assert(b.indexOf("evil") < 0, "ningún valor falso llega al upstream")
+    print("PASS fwd: X-Forwarded-Host/Proto del cliente se descartan y se reemplazan")
+}
+
+// Con `hk != "Host"` un `host` en minúsculas llegaba duplicado; y como el vhost
+// se buscaba con http_find_header (exacto), el pedido caía en el upstream por
+// defecto — acá, uno muerto: 502.
+fn test_host_en_minusculas_ni_duplica_ni_pierde_el_vhost() {
+    let b: String = pedir(0, "GET", ["host", VHOST], "")
+    assert(cuantas(b, "Host") == 1, "un `host` en minúsculas no llega duplicado")
+    assert(valor(b, "Host") == "127.0.0.1:" + int_to_string(PUERTO_ECO), "el Host que queda es el del backend")
+    assert(valor(b, "X-Forwarded-Host") == VHOST, "X-Forwarded-Host sale también de un `host` en minúsculas")
+    print("PASS fwd: `host` en minúsculas enruta al vhost y no se duplica")
+}
+
+fn test_post_lleva_un_solo_content_length() {
+    let b: String = pedir(0, "POST", ["Host", VHOST, "Content-Length", "3", "Content-Type", "text/plain"], "abc")
+    assert(cuantas(b, "Content-Length") == 1, "un solo Content-Length (antes: el del cliente + el del router)")
+    assert(valor(b, "Content-Length") == "3", "Content-Length medido sobre el cuerpo")
+    print("PASS fwd: un POST llega con un solo Content-Length")
+}
+
+fn main() -> int {
+    let srv: int = tcp_listen("127.0.0.1", PUERTO_ECO)
+    assert(srv >= 0, "bind del upstream eco")
+    g_srv_eco[0] = srv
+    let tid: int = thread_spawn(up_eco)
+
+    let ruta: String = "/tmp/nyx_proxy_test_fwd_headers.toml"
+    var cfg: String = "[server]\nlisten = 18081\n\n"
+    cfg = cfg + "[upstream.0]\nname = \"muerto\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n\n"
+    cfg = cfg + "[upstream.1]\nname = \"pos\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_ECO) + "\n"
+    cfg = cfg + "hostname = \"" + VHOST + "\"\n"
+    write_file(ruta, cfg)
+    load_config(ruta)
+    remove_file(ruta)
+    metrics_init()
+    pool_init()
+
+    test_host_original_va_en_x_forwarded_host()
+    test_host_con_puerto_se_conserva_entero()
+    test_listener_plano_manda_proto_http()
+    test_listener_tls_manda_proto_https()
+    test_x_forwarded_del_cliente_se_descartan()
+    test_host_en_minusculas_ni_duplica_ni_pierde_el_vhost()
+    test_post_lleva_un_solo_content_length()
+    // PEDIDOS_ECO cuenta los pedidos de arriba: si un caso no llega al eco, este
+    // join se cuelga y el runner lo corta con su timeout — falla a la vista.
+    thread_join(tid)
+    tcp_close(srv)
+    return 0
+}

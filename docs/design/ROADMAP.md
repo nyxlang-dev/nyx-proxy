@@ -29,10 +29,16 @@ lado la mencionaba.
 |---|---|---|
 | `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
 | `briefs/_recibidos/2026-09-24-nyx1036-pub.md` — avisos NYX1036 en tests | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.7): report al pie del encargo |
+| `briefs/_recibidos/2026-09-24-nyxerp-forwarded.md` — X-Forwarded-Host/Proto al upstream | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.8): report al pie del encargo; falta re-vendorizar el gateway (lo hace el lenguaje) |
 
 ## Pendientes (sin arco todavía)
 
-_(ninguno)_
+- **Opción por upstream para preservar el Host** del cliente en vez de reescribirlo a
+  `backend.host:port`. Se decidió no hacerla en v0.4.8: `X-Forwarded-Host` alcanzaba para el
+  caso que la motivó (nyxerp). Se retoma si aparece un backend que no lea X-Forwarded-Host.
+- **`Transfer-Encoding` del cliente**: `http_parse_request` solo lee cuerpos con
+  `Content-Length`, y el router reenvía el `Transfer-Encoding` del cliente tal cual. Un pedido
+  chunked llegaría al upstream con la cabecera y sin cuerpo.
 
 ## Cómo se trabaja acá
 

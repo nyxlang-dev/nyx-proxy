@@ -3,6 +3,41 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.8 — 2026-09-24
+
+**El upstream ya sabe por qué dominio y por qué esquema entró el cliente.**
+[encargo: lang-c1, nyxerp]
+
+nyxerp abre su punto de venta detrás del gateway y tenía el login en 403:
+compara el Origin con X-Forwarded-Host/Host, y el proxy no le daba ninguno.
+
+- `src/router.nx` — **fix**: se agrega `X-Forwarded-Host` con el Host
+  ORIGINAL del cliente, tal cual (con puerto si lo traía). El Host que recibe
+  el backend sigue siendo `backend.host:port`, así que sin esta cabecera no
+  tenía cómo conocer su dominio público (Origin, redirecciones absolutas).
+- **fix (silencioso)**: `X-Forwarded-Proto` iba FIJO en `http`. Ahora refleja
+  el listener: `https` si el cliente entró por TLS (`ssl_handle > 0` en
+  `proxy_dispatch_c`, y siempre en `ws_proxy`), `http` en el plano. Con el
+  valor fijo, las cookies `Secure` y las URLs absolutas del backend se
+  armaban mal. El handshake WebSocket no mandaba ninguno de los dos; ahora
+  manda ambos.
+- **fix (seguridad)**: los `X-Forwarded-Host`/`X-Forwarded-Proto` que manda el
+  cliente se DESCARTAN y se reemplazan, igual que ya se hacía con `X-Real-IP`:
+  eran falsificables.
+- **fix**: los nombres de cabecera se comparan sin mayúsculas. Con
+  `hk != "Host"`, un `host` en minúsculas llegaba DUPLICADO al upstream; y como
+  el vhost se buscaba con `http_find_header` (comparación exacta), ese pedido
+  además caía en el upstream por defecto.
+- **fix**: el `Content-Length` del cliente llegaba duplicado con el del router
+  en cada pedido con cuerpo. Ahora va uno solo, medido sobre el cuerpo real.
+- La firma de `inject_forwarded_headers` **no cambia**, ni la de ninguna fn
+  pública: el esquema sale de `ssl_handle`, que el consumer ya le pasa a
+  `proxy_dispatch_c`. Para el gateway alcanza con re-vendorizar.
+- Suite nueva `tests/test_proxy_fwd_headers.nx` (7 casos, upstream eco real).
+  Cada una de las seis fallas, reintroducida por separado, rompe su caso.
+- No se agregó una opción por upstream para preservar el Host: con
+  `X-Forwarded-Host` alcanza para el caso que la pidió. Queda como pendiente.
+
 ## v0.4.7 — 2026-09-24
 
 **Ocho fns de `src/router.nx` pasan a `pub`: los tests las llamaban desde otro

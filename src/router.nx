@@ -157,6 +157,8 @@ fn sse_release() {
 // Semántica: X-Real-IP entrante se DESCARTA (spoofeable) y se pone la IP
 // real; X-Forwarded-For entrante se preserva y se APPENDEA la IP (cadena
 // de proxies estándar). Permite rate-limit por IP en los backends.
+// X-Forwarded-Host y X-Forwarded-Proto NO van acá: los pone el router al armar
+// el pedido (upstream_header_lines), que es quien sabe si el listener es TLS.
 pub fn inject_forwarded_headers(headers: Array, client_ip: String) -> Array {
     var out: Array = []
     var xff_prev: String = ""
@@ -186,8 +188,80 @@ pub fn inject_forwarded_headers(headers: Array, client_ip: String) -> Array {
     return out
 }
 
-// Forward request to backend using pooled connection
+// Valor de la primera cabecera `name_low` (en minúsculas), comparando el nombre
+// SIN mayúsculas (RFC 9110 §5.1). `http_find_header` de std/http compara exacto:
+// un cliente que manda `host` en minúsculas no lo encontraba.
+fn header_ci(headers: Array, name_low: String) -> String {
+    var i: int = 0
+    while i + 1 < headers.length() {
+        let hk: String = headers[i]
+        if hk.toLower() == name_low {
+            let hv: String = headers[i + 1]
+            return hv
+        }
+        i = i + 2
+    }
+    return ""
+}
+
+// Las cabeceras del cliente que se reenvían al upstream, más las X-Forwarded-*
+// que pone el proxy. Lo usan el camino HTTP (forward_pooled_x) y el handshake WS
+// (ws_proxy), así que los dos reenvían lo mismo.
+//
+// Los nombres se comparan SIN mayúsculas. Se descartan:
+//   - Host: el router escribe el del backend. Antes se comparaba `hk != "Host"`
+//     y un `host` en minúsculas llegaba DUPLICADO al upstream.
+//   - X-Forwarded-Host y X-Forwarded-Proto: los pone el proxy, que es el único
+//     que sabe el dominio y el esquema por el que entró el cliente. Los que
+//     manda el cliente son falsificables, igual que su X-Real-IP.
+//   - Connection y Content-Length solo en el camino HTTP (`http_framing` = 1):
+//     el router escribe los suyos. El Content-Length del cliente llegaba
+//     DUPLICADO con el del router en cada POST. En el handshake WS la
+//     `Connection: Upgrade` del cliente tiene que pasar.
+//
+// X-Forwarded-Host lleva el Host ORIGINAL del cliente, tal cual (con puerto si
+// lo traía): sin él el backend no sabe su dominio público, porque el Host que
+// recibe es `backend.host:port`. Si el cliente no mandó Host, no se inventa.
+// X-Forwarded-Proto lleva el esquema real del listener: `https` o `http`.
+fn upstream_header_lines(headers: Array, scheme: String, http_framing: int) -> String {
+    let crlf: String = "\r\n"
+    var out: String = ""
+    var hi: int = 0
+    while hi + 1 < headers.length() {
+        let hk: String = headers[hi]
+        let hv: String = headers[hi + 1]
+        let hk_low: String = hk.toLower()
+        var skip: int = 0
+        if hk_low == "host" or hk_low == "x-forwarded-host" or hk_low == "x-forwarded-proto" {
+            skip = 1
+        }
+        if http_framing == 1 {
+            if hk_low == "connection" or hk_low == "content-length" {
+                skip = 1
+            }
+        }
+        if skip == 0 {
+            out = out + hk + ": " + hv + crlf
+        }
+        hi = hi + 2
+    }
+    let orig_host: String = header_ci(headers, "host")
+    if orig_host.length() > 0 {
+        out = out + "X-Forwarded-Host: " + orig_host + crlf
+    }
+    out = out + "X-Forwarded-Proto: " + scheme + crlf
+    return out
+}
+
+// Forward request to backend using pooled connection. Sin esquema: `http`. El
+// esquema real lo pasa proxy_dispatch_c a forward_pooled_x según el listener.
 pub fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend, tunnel_ok: int) -> Array {
+    return forward_pooled_x(idx, method, path, headers, body, backend, tunnel_ok, "http")
+}
+
+// `scheme` es el esquema por el que entró el cliente ("https" o "http") y va en
+// X-Forwarded-Proto.
+fn forward_pooled_x(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend, tunnel_ok: int, scheme: String) -> Array {
     var fd: int = pool_get(idx, backend.host, backend.port)
     if fd < 0 {
         // Fallo de conexion INICIAL (pool vacio y tcp_connect fallo dentro
@@ -205,21 +279,13 @@ pub fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, 
     var req: String = method + " " + path + " HTTP/1.1" + crlf
     req = req + "Host: " + backend.host + ":" + int_to_string(backend.port) + crlf
 
-    // Forward original headers (skip Host, Connection)
-    var hi: int = 0
-    while hi + 1 < headers.length() {
-        let hk: String = headers[hi]
-        let hv: String = headers[hi + 1]
-        if hk != "Host" and hk != "Connection" {
-            req = req + hk + ": " + hv + crlf
-        }
-        hi = hi + 2
-    }
-
-    req = req + "X-Forwarded-Proto: http" + crlf
+    req = req + upstream_header_lines(headers, scheme, 1)
     req = req + "Connection: keep-alive" + crlf
 
-    if body.length() > 0 {
+    // El Content-Length del cliente no se reenvía (upstream_header_lines): se
+    // escribe uno solo, medido sobre el cuerpo real. Un `Content-Length: 0` del
+    // cliente se conserva como tal: hay upstreams que piden 411 a un POST sin él.
+    if body.length() > 0 or header_ci(headers, "content-length").length() > 0 {
         req = req + "Content-Length: " + int_to_string(str_byte_length(body)) + crlf
     }
 
@@ -1099,15 +1165,8 @@ pub fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, h
     let crlf: String = "\r\n"
     var req: String = method + " " + forward_path + " HTTP/1.1" + crlf
     req = req + "Host: " + backend.host + ":" + int_to_string(backend.port) + crlf
-    var hi: int = 0
-    while hi + 1 < headers.length() {
-        let hk: String = headers[hi]
-        let hv: String = headers[hi + 1]
-        if hk != "Host" {
-            req = req + hk + ": " + hv + crlf
-        }
-        hi = hi + 2
-    }
+    // ws_proxy solo lo llama el listener TLS (escribe con tls_write_conn).
+    req = req + upstream_header_lines(headers, "https", 0)
     req = req + crlf
     tcp_write(up_fd, req)
 
@@ -1191,7 +1250,7 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     // upstream so the correct site serves its own copy of the design system.
 
     // Virtual host routing: match Host header first
-    let host_header: String = http_find_header(headers, "Host")
+    let host_header: String = header_ci(headers, "host")
     // Strip port from Host header (e.g. "nyxkv.com:443" -> "nyxkv.com")
     var host_name: String = host_header
     let colon_pos: int = host_header.indexOf(":")
@@ -1310,7 +1369,12 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
         tunnel_ok = 1
     }
     let t0: int = monotonic_us()
-    let fr: Array = forward_pooled_c(best_idx, method, forward_path, headers, body, backend, tunnel_ok)
+    // Convención del sink (arriba): ssl_handle > 0 ⇒ el cliente entró por TLS.
+    var scheme: String = "http"
+    if ssl_handle > 0 {
+        scheme = "https"
+    }
+    let fr: Array = forward_pooled_x(best_idx, method, forward_path, headers, body, backend, tunnel_ok, scheme)
     let resp: String = fr[0]
     let sse_fd: int = fr[1]
     let t1: int = monotonic_us()

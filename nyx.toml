@@ -1,6 +1,6 @@
 [package]
 name = "nyx-proxy"
-version = "0.4.7"
+version = "0.4.8"
 main = "examples/standalone.nx"
 description = "Reverse proxy library: TLS, SNI, rate limiting, response cache, /metrics, health checks, access logs"
 
