@@ -1,6 +1,7 @@
 # ROADMAP — arcos vivos de nyx-proxy
 
-> **Rol de este archivo**: SOLO los arcos VIVOS y los encargos abiertos. Un arco que cierra se
+> **Rol de este archivo**: SOLO los arcos VIVOS, los encargos abiertos y los pendientes fichados
+> que todavía no son arco. Un arco que cierra se
 > BORRA de acá — su narración va al `CHANGELOG.md` y su ledger queda cosechado en
 > `docs/archive/sdd/<arco>/`. Es la «doc raíz» del método: un documento de diseño VIGENTE se
 > sostiene porque este archivo lo cita, porque otro documento VIGENTE citado desde acá lo cita,
@@ -28,6 +29,18 @@ lado la mencionaba.
 |---|---|---|
 | `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
 | `briefs/_recibidos/2026-09-24-nyx1036-pub.md` — avisos NYX1036 en tests | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.7): report al pie del encargo |
+
+## Pendientes (sin arco todavía)
+
+- **`scripts/run_unit_tests.sh` corre sobre un scratch compartido** (fichado el 2026-09-24).
+  Copia cada suite a `$NYX_HOME/script.nx` y compila y ejecuta ahí: es un archivo ÚNICO del
+  toolchain, así que dos corridas a la vez —de este repo o de cualquier otro que use el mismo
+  `NYX_HOME`— se pisan, y una puede terminar ejecutando el binario de la otra sin ningún error
+  que lo delate (pasó en la sesión del túnel SSE; ver `AGENTS.md` §Tests). Es la misma carrera
+  que el lenguaje arregló en `nyx test` el 2026-09-20. Hoy se esquiva copiando el toolchain a
+  un `NYX_HOME` propio. Salida: migrar a `nyx test`, o compilar en un directorio de
+  `mktemp -d` propio por corrida. Cualquiera de las dos tiene que conservar la lista explícita
+  de suites y el `timeout 60` por suite.
 
 ## Cómo se trabaja acá
 
