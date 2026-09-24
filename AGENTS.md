@@ -138,12 +138,15 @@ que importa», el test tiene que medir el número, la señal o el tiempo — no 
 casos del túnel SSE están escritos así a propósito: miden que la pausa del upstream se *preserve*,
 no que los eventos *lleguen*.
 
-**El toolchain es compartido y eso puede corromper una corrida.** `run_unit_tests.sh` copia cada
-suite a `$NYX_HOME/script.nx`, que es un archivo ÚNICO en el repo del lenguaje. Si hay otra sesión
-compilando ahí —cosa que pasa— tu corrida puede terminar ejecutando el binario de otro test, sin
-ningún error que lo delate. Pasó en la sesión que escribió el túnel SSE: la primera corrida del RED
-devolvió la salida de un test ajeno. La salida: copiar `nyx_bootstrap`, `runtime/` y `std/` a un
-directorio propio y correr con `NYX_HOME=<ese directorio>`. Son ~16 MB y aísla por completo.
+**Cada corrida compila en un directorio propio de `mktemp`, nunca en `$NYX_HOME`.** Hasta el
+2026-09-24 `run_unit_tests.sh` copiaba cada suite a `$NYX_HOME/script.nx`, un archivo ÚNICO del
+toolchain: si otra sesión compilaba ahí —cosa que pasa— la corrida podía terminar ejecutando el
+binario de otro test, sin ningún error que lo delatara. Pasó en la sesión que escribió el túnel
+SSE: la primera corrida del RED devolvió la salida de un test ajeno. Ahora de `NYX_HOME` solo se
+lee. Dos cuidados si tocás el runner: el bootstrap busca `std/` primero en el cwd, así que el
+directorio de trabajo no puede tener un `std/` propio; y lo que sigue compartido son los puertos
+fijos y los archivos de `/tmp` de las suites, que chocan a la vista (bind rechazado), no en
+silencio.
 
 Dos cosas más que hay que saber:
 
