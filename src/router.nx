@@ -8,11 +8,11 @@ import "std/net"
 import "src/cache"
 import "src/metrics"
 
-// `pub` en pool_init/pool_get/pool_len, forward_pooled(_c), read_upstream_response,
-// upstream_set_close_timeout y sse_tunnel: son las costuras que las suites de
-// tests/ ejercitan directo (encuadre, reuso del pool, túnel SSE). Son superficie
-// de test y diagnóstico, NO API estable: la API del consumer es proxy_dispatch(_c),
-// ws_proxy y los setters documentados.
+// `pub` en pool_init/pool_get/pool_len, forward_pooled(_c), read_upstream_response
+// y sse_tunnel: son las costuras que las suites de tests/ ejercitan directo
+// (encuadre, reuso del pool, túnel SSE). Son superficie de test y diagnóstico,
+// NO API estable: la API del consumer es proxy_dispatch(_c), ws_proxy y los
+// setters de configuración (sse_set_max_tunnels, upstream_set_close_timeout).
 //
 // Connection pools: one array of fds per upstream (max 16 upstreams)
 var g_pools: Array = []
