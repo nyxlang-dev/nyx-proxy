@@ -8,12 +8,18 @@ import "std/net"
 import "src/cache"
 import "src/metrics"
 
+// `pub` en pool_init/pool_get/pool_len, forward_pooled(_c), read_upstream_response,
+// upstream_set_close_timeout y sse_tunnel: son las costuras que las suites de
+// tests/ ejercitan directo (encuadre, reuso del pool, túnel SSE). Son superficie
+// de test y diagnóstico, NO API estable: la API del consumer es proxy_dispatch(_c),
+// ws_proxy y los setters documentados.
+//
 // Connection pools: one array of fds per upstream (max 16 upstreams)
 var g_pools: Array = []
 var g_pool_mtx: Map = Map.new()
 var g_pools_init: int = 0
 
-fn pool_init() {
+pub fn pool_init() {
     if g_pools_init == 1 { return 0 }
     g_pool_mtx = mutex_new()
     var i: int = 0
@@ -27,7 +33,7 @@ fn pool_init() {
 }
 
 // Get a fd from the pool for upstream idx, or open a new connection
-fn pool_get(idx: int, host: String, port: int) -> int {
+pub fn pool_get(idx: int, host: String, port: int) -> int {
     mutex_lock(g_pool_mtx)
     let pool: Array = g_pools[idx]
     if pool.length() > 0 {
@@ -60,7 +66,7 @@ fn pool_discard(fd: int) {
 }
 
 // fds ociosos en el pool de un upstream (tests y diagnóstico).
-fn pool_len(idx: int) -> int {
+pub fn pool_len(idx: int) -> int {
     mutex_lock(g_pool_mtx)
     let pool: Array = g_pools[idx]
     let n: int = pool.length()
@@ -79,7 +85,7 @@ var g_upstream_max_body: int = 16777216
 // stream, un SSE, un bug) se corta con 502 en vez de colgar el worker para siempre.
 var g_upstream_close_timeout_s: int = 30
 
-fn upstream_set_close_timeout(seconds: int) {
+pub fn upstream_set_close_timeout(seconds: int) {
     g_upstream_close_timeout_s = seconds
 }
 
@@ -181,7 +187,7 @@ pub fn inject_forwarded_headers(headers: Array, client_ip: String) -> Array {
 }
 
 // Forward request to backend using pooled connection
-fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend, tunnel_ok: int) -> Array {
+pub fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend, tunnel_ok: int) -> Array {
     var fd: int = pool_get(idx, backend.host, backend.port)
     if fd < 0 {
         // Fallo de conexion INICIAL (pool vacio y tcp_connect fallo dentro
@@ -269,7 +275,7 @@ fn forward_pooled_c(idx: int, method: String, path: String, headers: Array, body
 
 // Nombre viejo: String, sin túnel. Lo usan los 11 casos de
 // test_proxy_pool_framing directamente, así que su contrato no se toca.
-fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
+pub fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: String, backend: Backend) -> String {
     let r: Array = forward_pooled_c(idx, method, path, headers, body, backend, 0)
     return r[0]
 }
@@ -296,7 +302,7 @@ fn forward_pooled(idx: int, method: String, path: String, headers: Array, body: 
 // con Content-Length: el gateway escribe la respuesta entera de una vez y la
 // cache guarda respuestas con longitud (el «off-by-8»), así que reemitir chunked
 // obligaría a enseñarle ese encuadre a los dos sin ganar nada.
-fn read_upstream_response(upstream_idx: int, fd: int) -> Array {
+pub fn read_upstream_response(upstream_idx: int, fd: int) -> Array {
     return read_upstream_response_m(upstream_idx, "GET", fd)
 }
 
@@ -974,7 +980,7 @@ fn sse_client_alive(ssl_handle: int, client_fd: int) -> int {
 // Relaya el stream hasta que cualquiera de los dos extremos corte.
 // Devuelve 0 = el túnel corrió (y up_fd quedó cerrado);
 //          1 = RECHAZADO por cupo (up_fd ya descartado, el caller manda 503).
-fn sse_tunnel(ssl_handle: int, client_fd: int, up_fd: int, head: String) -> int {
+pub fn sse_tunnel(ssl_handle: int, client_fd: int, up_fd: int, head: String) -> int {
     if sse_reserve() == 0 {
         pool_discard(up_fd)
         return 1

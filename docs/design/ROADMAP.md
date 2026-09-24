@@ -9,7 +9,7 @@
 > Sin números de versión: la fuente de verdad es `nyx.toml`. Sin conteo de tests: es
 > `scripts/run_unit_tests.sh`. El estado operativo del proyecto vive fuera del repo.
 >
-> Última actualización: 2026-09-20.
+> Última actualización: 2026-09-24.
 
 ---
 
@@ -27,6 +27,7 @@ lado la mencionaba.
 | Encargo | De | Estado |
 |---|---|---|
 | `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
+| `briefs/_recibidos/2026-09-24-nyx1036-pub.md` — avisos NYX1036 en tests | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.7): report al pie del encargo |
 
 ## Cómo se trabaja acá
 

@@ -3,6 +3,23 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.7 — 2026-09-24
+
+**Ocho fns de `src/router.nx` pasan a `pub`: los tests las llamaban desde otro
+módulo y el lenguaje va a dejar de permitirlo.** [encargo: lang-c1, NYX1036]
+
+- El toolchain 0.33.0 arregló un bug del resolvedor que ocultaba NYX1036 (llamar
+  a una fn sin `pub` desde otro módulo). Las suites del proxy tenían 76 llamadas
+  así; hoy son aviso y en la próxima versión menor del lenguaje serán error.
+- `pool_init`, `pool_get`, `pool_len`, `forward_pooled`, `forward_pooled_c`,
+  `read_upstream_response`, `upstream_set_close_timeout` y `sse_tunnel` son ahora
+  `pub`. Son las costuras que los tests ejercitan directo; ir por
+  `proxy_dispatch` dejaría de medir el pool y pasaría en verde sobre el bug que
+  cazan. Un comentario en el router las marca como superficie de test y
+  diagnóstico, no como API estable.
+- Sin cambio de comportamiento. `nyx check` de las 9 suites sin avisos y
+  `make test-proxy` en verde.
+
 ## v0.4.6 — 2026-09-20
 
 **Se retira la mitigación de SIGPIPE: el arreglo de verdad ya está en el
