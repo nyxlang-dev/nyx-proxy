@@ -108,6 +108,9 @@ intermedio falla. `wrote > 0` no es «salió bien».
 de `104d400` el router devolvía al pool conexiones con el cuerpo sin leer y el pedido siguiente
 —quizá de otro usuario— leía la respuesta ajena. `pool_put` se llama en **un solo lugar**; si
 agregás un camino de salida a `read_upstream_response_*`, decidí explícitamente si descarta.
+Y al SALIR del pool, un fd se sondea antes de usarse (read de plazo 0) y se
+descarta si venció su ocio: desde v0.4.9, porque un upstream que ya cerró la conexión ociosa
+recibía el write sin error y el POST terminaba en 502 (no se reintenta, y está bien que no).
 
 **No hay HTTP/2 al upstream** (solo HTTP/1.1), el cache **ignora `Vary`** (la clave es
 `host:path`) y los health checks son **solo TCP**.

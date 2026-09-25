@@ -3,6 +3,37 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.9 — 2026-09-25
+
+**El pool ya no reutiliza una conexión que el upstream cerró por ociosa: un POST
+tras un rato sin tráfico daba 502.** [encargo: lang-c1, nyxerp]
+
+std/serve cierra la keep-alive ociosa a los 15 s y el pool no miraba el tiempo.
+Reutilizaba el fd, el write salía bien, no volvía ni un byte y, como un POST no
+se reintenta, el cliente recibía 502. En nyxerp: 1 de cada 3 `POST /entrar` tras
+~20 s sin tráfico.
+
+- `src/router.nx` — **fix**: `pool_get` sondea cada fd ANTES de devolverlo, con
+  un read de plazo 0 (`try_tcp_read_timed(fd, 1, 0)`: solo `poll`, no bloquea).
+  Una conexión ociosa sana da timeout; EOF, error o bytes sueltos la descartan y
+  se prueba la siguiente o se abre una nueva. Así el 502 se evita sin reintentar
+  nada que el upstream haya visto.
+- **nuevo**: cada fd entra al pool con un vencimiento. `[server]
+  upstream_idle_timeout` (default **10 s**, menor que los 15 s de std/serve; `0`
+  apaga el reuso). Vencido, se cierra sin usarlo.
+- **nuevo**: si la respuesta trae `Keep-Alive: timeout=N`, esa conexión vale
+  `min(upstream_idle_timeout, N-1)`; con `N <= 1` ni entra al pool.
+- **fix**: el `Keep-Alive` del upstream ya no se reenvía al cliente: es
+  hop-by-hop (RFC 9110 §7.6.1) y hablaba de la conexión proxy→upstream.
+- **Sin cambio**: un POST/PUT/PATCH/DELETE con cero bytes de respuesta sigue sin
+  reintentarse. Un upstream que muere a mitad del handler también da cero bytes.
+- Sin cambio de firma en funciones públicas. El gateway no necesita tocar su
+  `proxy.toml`: el default de 10 s ya aplica.
+- Suite nueva `tests/test_proxy_pool_idle.nx` (5 casos). El del encargo: un
+  upstream que cierra la ociosa a los 2 s, y un POST a los 3 s da 200, llega UNA
+  vez y por una conexión nueva. Con el router anterior da 502. Cada defensa
+  retirada por separado rompe su caso.
+
 ## v0.4.8 — 2026-09-24
 
 **El upstream ya sabe por qué dominio y por qué esquema entró el cliente.**

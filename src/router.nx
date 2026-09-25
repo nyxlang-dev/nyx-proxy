@@ -14,8 +14,11 @@ import "src/metrics"
 // NO API estable: la API del consumer es proxy_dispatch(_c), ws_proxy y los
 // setters de configuración (sse_set_max_tunnels, upstream_set_close_timeout).
 //
-// Connection pools: one array of fds per upstream (max 16 upstreams)
+// Connection pools: one array of fds per upstream (max 16 upstreams).
+// `g_pool_exp` es paralelo a `g_pools`: para cada fd, el instante (monotonic_us)
+// en que deja de poder reutilizarse. Se apilan y desapilan juntos bajo el mutex.
 var g_pools: Array = []
+var g_pool_exp: Array = []
 var g_pool_mtx: Map = Map.new()
 var g_pools_init: int = 0
 
@@ -26,38 +29,135 @@ pub fn pool_init() {
     while i < 16 {
         let pool: Array = []
         g_pools.push(pool)
+        let exp: Array = []
+        g_pool_exp.push(exp)
         i = i + 1
     }
     g_pools_init = 1
     return 0
 }
 
-// Get a fd from the pool for upstream idx, or open a new connection
-pub fn pool_get(idx: int, host: String, port: int) -> int {
-    mutex_lock(g_pool_mtx)
-    let pool: Array = g_pools[idx]
-    if pool.length() > 0 {
-        let fd: int = pool.pop()
-        mutex_unlock(g_pool_mtx)
-        return fd
+// CONEXIONES QUE EL UPSTREAM YA CERRÓ (2026-09-25). std/serve cierra la
+// keep-alive ociosa a los 15 s. El pool no miraba el tiempo: reutilizaba el fd,
+// el write salía bien (el kernel lo acepta aunque el peer ya mandó FIN), no
+// volvía ni un byte, y como un POST no se reintenta —con razón, ver
+// forward_pooled_x— el cliente recibía 502. En nyxerp: 1 de cada 3 POST tras
+// ~20 s sin tráfico. Dos defensas, ANTES de escribir nada:
+//   1. vencimiento: cada fd entra al pool con un plazo de ocio menor que el del
+//      upstream (`server.upstream_idle_timeout`, o el `Keep-Alive: timeout=N`
+//      que anuncie la respuesta); vencido, se cierra sin usarlo;
+//   2. sondeo: un read con plazo 0 (solo `poll`, no bloquea). Una conexión
+//      ociosa sana no tiene nada que leer: da timeout. Si da EOF, un error, o
+//      bytes sueltos que nadie pidió, no sirve y se descarta.
+// Sigue quedando la carrera de un cierre ENTRE el sondeo y el write; el plazo
+// de ocio menor que el del upstream es lo que la vuelve improbable.
+fn pool_fd_idle_ok(fd: int) -> int {
+    var ok: int = 0
+    match try_tcp_read_timed(fd, 1, 0) {
+        Result.Ok(s) => { ok = 0 }
+        Result.Err(e) => {
+            // 110 = venció el plazo sin consumir nada: viva e intacta. Por
+            // `e.code`, no por `e.kind` (ver AGENTS.md).
+            if e.code == 110 {
+                ok = 1
+            }
+        }
     }
-    mutex_unlock(g_pool_mtx)
+    return ok
+}
+
+// Get a fd from the pool for upstream idx, or open a new connection. Del pool se
+// toma el más reciente; uno vencido o que no pasa el sondeo se cierra y se
+// prueba el siguiente.
+pub fn pool_get(idx: int, host: String, port: int) -> int {
+    var got: int = -1
+    var vacio: int = 0
+    while got < 0 and vacio == 0 {
+        mutex_lock(g_pool_mtx)
+        let pool: Array = g_pools[idx]
+        let exp: Array = g_pool_exp[idx]
+        if pool.length() == 0 {
+            vacio = 1
+            mutex_unlock(g_pool_mtx)
+        } else {
+            let fd: int = pool.pop()
+            let vence: int = exp.pop()
+            mutex_unlock(g_pool_mtx)
+            if monotonic_us() < vence and pool_fd_idle_ok(fd) == 1 {
+                got = fd
+            } else {
+                tcp_close(fd)
+            }
+        }
+    }
+    if got >= 0 {
+        return got
+    }
     // Pool empty — open new connection
     let fd: int = tcp_connect(host, port)
     return fd
 }
 
-// Return a fd to the pool (max 16 per upstream), or close it
-fn pool_put(idx: int, fd: int) {
+// Return a fd to the pool (max 16 per upstream), or close it. `idle_s` es cuánto
+// puede esperar ocioso antes de dejar de reutilizarse; <= 0 no lo guarda.
+fn pool_put(idx: int, fd: int, idle_s: int) {
+    if idle_s <= 0 {
+        tcp_close(fd)
+        return 0
+    }
+    let vence: int = monotonic_us() + idle_s * 1000000
     mutex_lock(g_pool_mtx)
     let pool: Array = g_pools[idx]
+    let exp: Array = g_pool_exp[idx]
     if pool.length() < 16 {
         pool.push(fd)
+        exp.push(vence)
         mutex_unlock(g_pool_mtx)
     } else {
         mutex_unlock(g_pool_mtx)
         tcp_close(fd)
     }
+    return 0
+}
+
+// Plazo de ocio (s) de una conexión al upstream según la respuesta: el
+// configurado, acotado por el `Keep-Alive: timeout=N` del upstream si lo manda
+// (N-1: un segundo de margen contra la carrera del cierre). `ka` es el valor de
+// la cabecera Keep-Alive, o "".
+fn pool_idle_for(ka: String) -> int {
+    var idle: int = g_upstream_idle_s
+    let n: int = keepalive_timeout_of(ka)
+    if n >= 0 and n - 1 < idle {
+        idle = n - 1
+    }
+    return idle
+}
+
+// `timeout=N` de un valor de Keep-Alive («timeout=15, max=100»), o -1.
+fn keepalive_timeout_of(ka: String) -> int {
+    let partes: Array = ka.split(",")
+    var i: int = 0
+    while i < partes.length() {
+        let p: String = partes[i]
+        let t: String = p.trim().toLower()
+        if t.startsWith("timeout=") {
+            let v: String = t.substring(8, str_byte_length(t)).trim()
+            if v.length() == 0 {
+                return -1
+            }
+            var j: int = 0
+            while j < v.length() {
+                let c: String = v.substring(j, j + 1)
+                if "0123456789".indexOf(c) < 0 {
+                    return -1
+                }
+                j = j + 1
+            }
+            return string_to_int(v)
+        }
+        i = i + 1
+    }
+    return -1
 }
 
 // Discard a broken fd (don't return to pool)
@@ -566,6 +666,7 @@ fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_
     var ct_raw: String = ""
     var conn_close: int = 0
     var conn_keepalive: int = 0
+    var ka_raw: String = ""
     var interim: int = 1
     var hdone: int = 0
     while interim == 1 {
@@ -576,6 +677,7 @@ fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_
         ct_raw = ""
         conn_close = 0
         conn_keepalive = 0
+        ka_raw = ""
         hdone = 0
         while hdone == 0 {
             let line: String = tcp_read_line(fd)
@@ -601,6 +703,8 @@ fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_
                         }
                     } else if kl == "content-type" {
                         ct_raw = val
+                    } else if kl == "keep-alive" {
+                        ka_raw = val
                     } else if kl == "connection" {
                         let vl: String = val.toLower()
                         if vl.indexOf("close") >= 0 {
@@ -739,7 +843,7 @@ fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_
 
     // Return fd to pool for reuse — solo con el cuerpo leído entero y su fin conocido
     if reusable == 1 {
-        pool_put(upstream_idx, fd)
+        pool_put(upstream_idx, fd, pool_idle_for(ka_raw))
     } else {
         pool_discard(fd)
     }
@@ -754,7 +858,9 @@ fn read_upstream_response_mc(upstream_idx: int, method: String, fd: int, tunnel_
         let rv: String = resp_headers[ri + 1]
         let rkl: String = rk.toLower()
         var keep: int = 1
-        if rkl == "connection" {
+        // Hop-by-hop (RFC 9110 §7.6.1): el Keep-Alive del upstream habla de SU
+        // conexión con el proxy, no de la del cliente con el gateway.
+        if rkl == "connection" or rkl == "keep-alive" {
             keep = 0
         }
         if no_body == 0 {

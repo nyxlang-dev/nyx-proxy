@@ -1,0 +1,236 @@
+// test_proxy_pool_idle.nx — el pool no reutiliza una conexión que el upstream ya
+// cerró por ociosa (2026-09-25).
+//
+// Bug que fija: std/serve cierra la keep-alive ociosa a los 15 s y el pool no
+// miraba el tiempo. Reutilizaba el fd, el write salía bien (el kernel lo acepta
+// aunque el peer ya mandó FIN), no volvía ni un byte y, como un POST no se
+// reintenta —con razón: un upstream que muere a mitad del handler también da cero
+// bytes—, el cliente recibía 502. En nyxerp, 1 de cada 3 POST /entrar tras ~20 s
+// sin tráfico.
+//
+// Cada caso mide qué le pasa a la conexión DEL LADO DEL UPSTREAM (cuántas
+// aceptó, si la vieja vio EOF o un pedido nuevo, cuántas veces llegó el POST),
+// no solo que la respuesta sea 200: un 200 por reintento pasaría igual.
+
+import "std/http"
+import "std/proxy"
+import "std/net"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+
+var g_srv: Array = [0]
+// Cabecera extra que el upstream falso agrega a sus respuestas ("" = ninguna).
+var g_extra: Array = [""]
+var g_posts: Array = [0]
+var g_aceptadas: Array = [0]
+// Qué vio el upstream en la conexión vieja: 1 = EOF (el proxy la cerró sin
+// usarla), 2 = un pedido nuevo (el proxy la reutilizó), 3 = nada en 5 s.
+var g_estado: Array = [0]
+
+// Atiende un pedido en `c`: request line (`prefijo` es lo que ya se leyó de
+// ella), cabeceras y cuerpo por Content-Length. Devuelve 0 si la conexión se
+// cerró o venció su plazo antes de la request line.
+fn atender(c: int, prefijo: String) -> int {
+    let rl: String = prefijo + tcp_read_line(c)
+    if rl.length() == 0 {
+        return 0
+    }
+    var largo: int = 0
+    var fin: int = 0
+    while fin == 0 {
+        let l: String = tcp_read_line(c)
+        if l.length() == 0 {
+            fin = 1
+        } else {
+            let baja: String = l.toLower()
+            if baja.startsWith("content-length:") {
+                largo = string_to_int(l.substring(15, str_byte_length(l)).trim())
+            }
+        }
+    }
+    if largo > 0 {
+        let cuerpo: String = tcp_read(c, largo)
+    }
+    if rl.startsWith("POST ") {
+        g_posts[0] = g_posts[0] + 1
+    }
+    var resp: String = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+    let extra: String = g_extra[0]
+    if extra.length() > 0 {
+        resp = resp + extra + "\r\n"
+    }
+    tcp_write(c, resp + "\r\nok")
+    return 1
+}
+
+// Upstream que cierra la conexión ociosa a los 2 s, como std/serve a los 15 s.
+// Atiende 2 pedidos en total, en las conexiones que hagan falta.
+fn up_cierra_ociosa() -> int {
+    var servidos: int = 0
+    while servidos < 2 {
+        let c: int = tcp_accept(g_srv[0])
+        g_aceptadas[0] = g_aceptadas[0] + 1
+        tcp_set_timeout(c, 2)
+        var viva: int = 1
+        while viva == 1 and servidos < 2 {
+            if atender(c, "") == 1 {
+                servidos = servidos + 1
+            } else {
+                viva = 0
+            }
+        }
+        tcp_close(c)
+    }
+    return 0
+}
+
+// Upstream que NO cierra la ociosa: atiende un pedido y espera hasta 5 s a ver
+// qué hace el proxy con esa conexión. Si la cierra (EOF), atiende el segundo
+// pedido en una conexión nueva; si la reutiliza, lo atiende ahí.
+fn up_mira_la_vieja() -> int {
+    let c: int = tcp_accept(g_srv[0])
+    g_aceptadas[0] = 1
+    atender(c, "")
+    match try_tcp_read_timed(c, 1, 5000) {
+        Result.Ok(s) => {
+            g_estado[0] = 2
+            atender(c, s)
+            tcp_close(c)
+        }
+        Result.Err(e) => {
+            tcp_close(c)
+            if e.code == 0 {
+                g_estado[0] = 1
+                let c2: int = tcp_accept(g_srv[0])
+                g_aceptadas[0] = 2
+                atender(c2, "")
+                tcp_close(c2)
+            } else {
+                g_estado[0] = 3
+            }
+        }
+    }
+    return 0
+}
+
+fn levantar(puerto: int, extra: String) -> Backend {
+    let srv: int = tcp_listen("127.0.0.1", puerto)
+    assert(srv >= 0, "bind del upstream falso")
+    g_srv[0] = srv
+    g_extra[0] = extra
+    g_posts[0] = 0
+    g_aceptadas[0] = 0
+    g_estado[0] = 0
+    let b: Backend = Backend { host: "127.0.0.1", port: puerto }
+    return b
+}
+
+fn h() -> Array {
+    let hs: Array = ["Host", "pos.test"]
+    return hs
+}
+
+// El caso del encargo: el upstream cerró la ociosa, el POST llega igual, UNA vez.
+// El plazo de ocio del proxy (10 s) es MAYOR que el del upstream (2 s) a
+// propósito: lo que lo salva acá es el sondeo, no el vencimiento.
+fn test_post_tras_cierre_ocioso_da_200_y_llega_una_vez() {
+    let b: Backend = levantar(19410, "")
+    let tid: int = thread_spawn(up_cierra_ociosa)
+    let r1: String = forward_pooled(1, "GET", "/", h(), "", b)
+    assert(r1.endsWith("ok"), "el primer pedido sale bien")
+    assert(pool_len(1) == 1, "y deja la conexión en el pool")
+    sleep(3000)
+    let hp: Array = ["Host", "pos.test", "Content-Length", "11", "Content-Type", "application/x-www-form-urlencoded"]
+    let r2: String = forward_pooled(1, "POST", "/entrar", hp, "usuario=ana", b)
+    // Antes del join: con el bug el upstream sigue esperando un POST que no
+    // llega, y el join colgaría en vez de fallar a la vista.
+    assert(r2.indexOf("HTTP/1.1 200") == 0, "POST tras el cierre ocioso: 200, no 502")
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    assert(g_posts[0] == 1, "el upstream recibe el POST UNA sola vez")
+    assert(g_aceptadas[0] == 2, "el POST va por una conexión nueva")
+    print("PASS pool: un POST tras el cierre ocioso del upstream da 200 y llega una vez")
+}
+
+// El vencimiento por sí solo: el upstream NO cerró la conexión, pero pasó el ocio
+// configurado. El proxy la cierra sin usarla y abre otra.
+fn test_vencida_por_ocio_configurado_no_se_reutiliza() {
+    g_upstream_idle_s = 1
+    let b: Backend = levantar(19411, "")
+    let tid: int = thread_spawn(up_mira_la_vieja)
+    let r1: String = forward_pooled(2, "GET", "/", h(), "", b)
+    sleep(1500)
+    let r2: String = forward_pooled(2, "GET", "/", h(), "", b)
+    let fd: int = pool_get(2, "127.0.0.1", 19411)
+    tcp_close(fd)
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    g_upstream_idle_s = 10
+    assert(r1.endsWith("ok") and r2.endsWith("ok"), "los dos pedidos salen bien")
+    assert(g_estado[0] == 1, "la conexión vencida se cierra sin mandarle nada (no se reutiliza)")
+    assert(g_aceptadas[0] == 2, "el segundo pedido abre una conexión nueva")
+    print("PASS pool: una conexión con el ocio configurado vencido no se reutiliza")
+}
+
+// `Keep-Alive: timeout=2` del upstream gana sobre los 10 s configurados: la
+// conexión vale 1 s (N-1). Y esa cabecera es hop-by-hop: no le llega al cliente.
+fn test_keep_alive_timeout_del_upstream_acota_el_ocio() {
+    let b: Backend = levantar(19412, "Keep-Alive: timeout=2, max=100")
+    let tid: int = thread_spawn(up_mira_la_vieja)
+    let r1: String = forward_pooled(3, "GET", "/", h(), "", b)
+    sleep(1500)
+    let r2: String = forward_pooled(3, "GET", "/", h(), "", b)
+    let fd: int = pool_get(3, "127.0.0.1", 19412)
+    tcp_close(fd)
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    assert(r1.endsWith("ok") and r2.endsWith("ok"), "los dos pedidos salen bien")
+    assert(g_estado[0] == 1, "con Keep-Alive: timeout=2 la conexión vale 1 s, no 10")
+    assert(r1.toLower().indexOf("keep-alive: timeout") < 0, "el Keep-Alive del upstream no se reenvía al cliente")
+    print("PASS pool: Keep-Alive: timeout=N del upstream acota el ocio a N-1")
+}
+
+// Control positivo del caso anterior: dentro del plazo, la conexión SÍ se
+// reutiliza. Sin esto, un pool que nunca reutiliza pasaría los casos de arriba.
+fn test_dentro_del_plazo_se_reutiliza() {
+    let b: Backend = levantar(19413, "Keep-Alive: timeout=5")
+    let tid: int = thread_spawn(up_mira_la_vieja)
+    let r1: String = forward_pooled(4, "GET", "/", h(), "", b)
+    sleep(500)
+    let r2: String = forward_pooled(4, "GET", "/", h(), "", b)
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    assert(r1.endsWith("ok") and r2.endsWith("ok"), "los dos pedidos salen bien")
+    assert(g_estado[0] == 2, "dentro del plazo la conexión se reutiliza")
+    assert(g_aceptadas[0] == 1, "una sola conexión")
+    print("PASS pool: dentro del plazo la conexión se reutiliza (control positivo)")
+}
+
+// `timeout=1` deja 0 s de margen: la conexión ni entra al pool.
+fn test_keep_alive_timeout_1_no_entra_al_pool() {
+    let b: Backend = levantar(19414, "Keep-Alive: timeout=1")
+    let tid: int = thread_spawn(up_mira_la_vieja)
+    let r1: String = forward_pooled(5, "GET", "/", h(), "", b)
+    let n: int = pool_len(5)
+    let r2: String = forward_pooled(5, "GET", "/", h(), "", b)
+    let fd: int = pool_get(5, "127.0.0.1", 19414)
+    tcp_close(fd)
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    assert(n == 0, "con Keep-Alive: timeout=1 la conexión no vuelve al pool")
+    assert(g_estado[0] == 1, "se cierra apenas termina la respuesta")
+    print("PASS pool: Keep-Alive: timeout=1 no deja la conexión en el pool")
+}
+
+fn main() -> int {
+    pool_init()
+    test_post_tras_cierre_ocioso_da_200_y_llega_una_vez()
+    test_vencida_por_ocio_configurado_no_se_reutiliza()
+    test_keep_alive_timeout_del_upstream_acota_el_ocio()
+    test_dentro_del_plazo_se_reutiliza()
+    test_keep_alive_timeout_1_no_entra_al_pool()
+    return 0
+}

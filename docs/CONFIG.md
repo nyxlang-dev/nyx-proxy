@@ -14,6 +14,7 @@ Configuration is read from `proxy.toml` in the working directory at startup.
 | `health_check_interval` | int | `10` | Seconds between TCP health checks per backend |
 | `health_check_threshold` | int | `3` | Consecutive failures before a backend is marked unhealthy |
 | `access_log` | string | `""` | Path for the access log; empty disables |
+| `upstream_idle_timeout` | int | `10` | Seconds an idle keep-alive connection to an upstream may wait in the pool before it is closed instead of reused (v0.4.9+). Keep it **below** the upstreams' own idle timeout (`std/serve` closes at 15 s). An upstream's `Keep-Alive: timeout=N` lowers it to `N-1` for that connection. `0` disables reuse. Reloads with the config. |
 | `tls_cert` | string | — | Path to TLS certificate (PEM). Setting it enables TLS mode. |
 | `tls_key` | string | — | Path to TLS private key (PEM). Required for TLS mode. |
 
