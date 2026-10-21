@@ -66,6 +66,15 @@ fn reset_routing_globals() {
     g_vhost_count = 0
 }
 
+// `*` solo como etiqueta izquierda entera seguida de un dominio no vacío.
+fn vhost_pattern_ok(hostname: String) -> bool {
+    if hostname.indexOf("*") < 0 { return true }
+    if hostname.startsWith("*.") == false { return false }
+    let rest: String = hostname.substring(2, hostname.byte_length())
+    if rest.byte_length() == 0 { return false }
+    return rest.indexOf("*") < 0
+}
+
 pub fn load_config(path: String) {
     g_config_path = path
     g_config_mtime = config_file_mtime(path)
@@ -102,8 +111,13 @@ pub fn load_config(path: String) {
             g_default_upstream = g_upstream_count
         }
 
-        // Register virtual host if hostname specified
-        if hostname.length() > 0 {
+        // Register virtual host if hostname specified. A wildcard is valid only as
+        // the whole leftmost label (`*.dominio`, which covers one label — see
+        // router.vhost_name_matches); anything else (`a*.dominio`, `*.`, a `*`
+        // further right) is skipped loudly instead of matching nothing in silence.
+        if hostname.length() > 0 and vhost_pattern_ok(hostname) == false {
+            println("nyx-proxy: hostname '" + hostname + "' de " + pfx + " ignorado: el comodín solo vale como primera etiqueta entera (*.dominio)")
+        } else if hostname.length() > 0 {
             g_vhost_names.push(hostname)
             g_vhost_indices.push(g_upstream_count)
             g_vhost_count = g_vhost_count + 1

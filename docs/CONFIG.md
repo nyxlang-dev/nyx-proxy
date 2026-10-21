@@ -35,11 +35,11 @@ One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2,
 | `name` | string | Yes | Logical name for logging |
 | `host` | string | Yes | Backend hostname or IP |
 | `port` | int | Yes | Backend port |
-| `hostname` | string | No | Route by `Host` header value |
+| `hostname` | string | No | Route by `Host` header value. `*.example.com` (v0.4.10+) matches exactly one non-empty label (`a.example.com`, not `example.com` nor `a.b.example.com`) — the same rule as a wildcard certificate. A `*` anywhere else is ignored with a warning at load. |
 | `path_prefix` | string | No | Route by request path prefix |
 
 **Routing priority** (per request):
-1. Upstream with matching `hostname`
+1. Upstream with matching `hostname` — exact hostnames first, then wildcards, regardless of their order in the file
 2. Upstream with matching `path_prefix`
 3. First upstream with neither (default catch-all)
 

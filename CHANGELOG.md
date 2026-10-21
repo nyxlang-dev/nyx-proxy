@@ -3,6 +3,29 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.10 — 2026-10-21
+
+**Hostname comodín de una etiqueta: `hostname = "*.dominio"` en un `[upstream]`.**
+[pedido: nyxerp]
+
+nyxerp da de alta clientes como `<cliente>.dominio` y necesitaba una sola ruta
+para todos, sin tocar el `proxy.toml` del gateway por cada alta.
+
+- `src/router.nx` — **nuevo**: `vhost_pick(host, path)` resuelve el vhost en dos
+  pasadas: los hostnames exactos primero y, si ninguno calza, los comodín. Una
+  ruta exacta (`demo.dominio`, la raíz `dominio`) gana aunque el comodín esté
+  declarado antes. Lo usan `proxy_dispatch` y el handshake WebSocket, que antes
+  tenían la pasada de vhosts copiada; ahora no pueden rutear distinto.
+- `*.dominio` cubre **una** etiqueta no vacía: ni la raíz ni `a.b.dominio`, igual
+  que un certificado comodín y que el SNI comodín del runtime (`tls_server_add_cert`).
+  El `path_prefix` más largo sigue ganando bajo el hostname, también el comodín.
+- `src/config.nx` — un `*` fuera de la primera etiqueta entera (`a*.dominio`,
+  `*.`) se ignora con un aviso al cargar, en vez de quedar registrado sin calzar
+  nunca.
+- Test: `tests/test_proxy_vhost_wildcard.nx` (6 casos, de punta a punta incluido).
+- Sin cambio de firma en funciones públicas. Un `proxy.toml` sin `*` rutea igual
+  que antes.
+
 ## v0.4.9 — 2026-09-25
 
 **El pool ya no reutiliza una conexión que el upstream cerró por ociosa: un POST

@@ -906,19 +906,36 @@ fn detect_mime_type(file_path: String) -> String {
     return "application/octet-stream"
 }
 
-// ── WebSocket proxying ──────────────────────────────────────────────────────
-// Resuelve el índice de upstream y el largo de prefix para (host, path). Duplica
-// la lógica de routing de proxy_dispatch (vhost two-pass → prefix → default) SIN
-// tocar proxy_dispatch (que tiene cache/singleflight en producción). Devuelve
-// [best_idx, best_len]; best_idx < 0 si no hay upstream configurado.
-fn resolve_upstream_idx(host_name: String, path: String) -> Array {
+// ── Virtual host matching ───────────────────────────────────────────────────
+// `*.dominio` cubre UNA etiqueta no vacía: `a.dominio` sí; `dominio` y `a.b.dominio`
+// no. Es la misma regla que el SNI con comodín del runtime (tls_server_add_cert) y
+// la de los certificados comodín, así que una ruta comodín nunca acepta un host
+// que su certificado no cubriría.
+fn vhost_name_matches(pattern: String, host_name: String) -> bool {
+    if pattern.startsWith("*.") == false {
+        return pattern == host_name
+    }
+    let suffix: String = pattern.substring(1, pattern.byte_length())
+    let hl: int = host_name.byte_length()
+    let sl: int = suffix.byte_length()
+    if hl <= sl { return false }
+    if host_name.endsWith(suffix) == false { return false }
+    let label: String = host_name.substring(0, hl - sl)
+    return label.indexOf(".") < 0
+}
+
+// Una pasada de vhosts para (host, path) con la regla de siempre: el path_prefix
+// más largo gana bajo el hostname, y si ninguno calza, el vhost sin prefix
+// (catch-all). `wildcard` elige qué patrones mira la pasada: los exactos o los
+// comodín. Devuelve [best_idx, best_len], best_idx < 0 si nada calzó.
+fn vhost_pass(host_name: String, path: String, wildcard: bool) -> Array {
     var best_idx: int = -1
     var best_len: int = 0
     var vhost_catchall_idx: int = -1
     var vi: int = 0
     while vi < g_vhost_count {
         let vname: String = g_vhost_names[vi]
-        if vname == host_name {
+        if vname.startsWith("*.") == wildcard and vhost_name_matches(vname, host_name) {
             let upstream_idx: int = g_vhost_indices[vi]
             let prefix: String = g_upstream_prefixes[upstream_idx]
             let plen: int = prefix.length()
@@ -940,6 +957,32 @@ fn resolve_upstream_idx(host_name: String, path: String) -> Array {
     if best_idx < 0 and vhost_catchall_idx >= 0 {
         best_idx = vhost_catchall_idx
     }
+    var res: Array = []
+    res.push(best_idx)
+    res.push(best_len)
+    return res
+}
+
+// Los hostnames exactos van ANTES que los comodín, sin importar el orden del
+// proxy.toml: `demo.nyxerp.com` sigue yendo a su upstream aunque `*.nyxerp.com`
+// esté declarado antes. Comparten la función de proxy_dispatch y de ws_proxy para
+// que HTTP y el handshake WebSocket no puedan rutear distinto.
+pub fn vhost_pick(host_name: String, path: String) -> Array {
+    let exact: Array = vhost_pass(host_name, path, false)
+    let ei: int = exact[0]
+    if ei >= 0 { return exact }
+    return vhost_pass(host_name, path, true)
+}
+
+// ── WebSocket proxying ──────────────────────────────────────────────────────
+// Resuelve el índice de upstream y el largo de prefix para (host, path). Duplica
+// la lógica de routing de proxy_dispatch (vhost_pick → prefix → default) SIN
+// tocar proxy_dispatch (que tiene cache/singleflight en producción). Devuelve
+// [best_idx, best_len]; best_idx < 0 si no hay upstream configurado.
+fn resolve_upstream_idx(host_name: String, path: String) -> Array {
+    let vh: Array = vhost_pick(host_name, path)
+    var best_idx: int = vh[0]
+    var best_len: int = vh[1]
     if best_idx < 0 {
         var i: int = 0
         while i < g_upstream_count {
@@ -1404,32 +1447,10 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     // path_prefix matches. Without this two-pass, a vhost without
     // path_prefix would shadow any vhost+path_prefix declared after it for
     // the same hostname, even when the prefix matched the request path.
-    var vhost_catchall_idx: int = -1
-    var vi: int = 0
-    while vi < g_vhost_count {
-        let vname: String = g_vhost_names[vi]
-        if vname == host_name {
-            let upstream_idx: int = g_vhost_indices[vi]
-            let prefix: String = g_upstream_prefixes[upstream_idx]
-            let plen: int = prefix.length()
-            if plen == 0 {
-                if vhost_catchall_idx < 0 {
-                    vhost_catchall_idx = upstream_idx
-                }
-            } else {
-                if path.startsWith(prefix) {
-                    if plen > best_len {
-                        best_idx = upstream_idx
-                        best_len = plen
-                    }
-                }
-            }
-        }
-        vi = vi + 1
-    }
-    if best_idx < 0 and vhost_catchall_idx >= 0 {
-        best_idx = vhost_catchall_idx
-    }
+    // Exact hostnames first, then one-label wildcards (`*.dominio`): see vhost_pick.
+    let vh: Array = vhost_pick(host_name, path)
+    best_idx = vh[0]
+    best_len = vh[1]
 
     // If no vhost match, try longest prefix match across non-vhost upstreams
     if best_idx < 0 {

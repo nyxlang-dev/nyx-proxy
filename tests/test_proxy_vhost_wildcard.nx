@@ -1,0 +1,132 @@
+// test_proxy_vhost_wildcard.nx — `hostname = "*.dominio"` en un upstream (2026-10-21).
+//
+// El pedido vino de nyxerp: da de alta clientes como `<cliente>.nyxerp.com` y no
+// quiere tocar el proxy.toml del gateway por cada uno. Una ruta comodín manda
+// todos esos hosts a su enrutador, mientras las rutas exactas que ya existen
+// (`demo.nyxerp.com`, la raíz `nyxerp.com`) siguen yendo a su upstream.
+//
+// Lo que se puede romper sin que nada falle a la vista:
+//   · que el comodín le gane a una ruta exacta porque está declarado antes
+//     (demo.nyxerp.com terminaría en el enrutador de clientes);
+//   · que cubra la raíz o dos etiquetas, que el certificado comodín NO cubre:
+//     el navegador daría error de certificado en un host que el proxy acepta;
+//   · que un patrón mal escrito (`a*.dominio`) quede registrado y no calce nunca.
+// Cada caso mira el ÍNDICE de upstream elegido, no solo que haya uno; y el
+// caso de punta a punta mira qué upstream contestó de verdad.
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/metrics"
+
+let PUERTO_COMODIN: int = 19410
+// Nadie escucha acá: si un pedido cae en este upstream, el router da 502.
+let PUERTO_MUERTO: int = 19411
+
+var g_srv: Array = [0]
+
+// Upstreams, en este orden: 0 comodín (eco), 1 comodín con /api, 2 exacto
+// demo (muerto), 3 raíz (muerto), 4 default (muerto), 5 patrón inválido.
+fn config_de_prueba() {
+    let path: String = "/tmp/nyx_proxy_test_vhost_wildcard.toml"
+    var cfg: String = "[server]\nlisten = 18099\n"
+    cfg = cfg + "\n[upstream.0]\nname = \"clientes\"\nhostname = \"*.nyxerp.test\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_COMODIN) + "\n"
+    cfg = cfg + "\n[upstream.1]\nname = \"clientes-api\"\nhostname = \"*.nyxerp.test\"\npath_prefix = \"/api\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n"
+    cfg = cfg + "\n[upstream.2]\nname = \"demo\"\nhostname = \"demo.nyxerp.test\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n"
+    cfg = cfg + "\n[upstream.3]\nname = \"raiz\"\nhostname = \"nyxerp.test\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n"
+    cfg = cfg + "\n[upstream.4]\nname = \"default\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n"
+    cfg = cfg + "\n[upstream.5]\nname = \"mal\"\nhostname = \"a*.otro.test\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_MUERTO) + "\n"
+    write_file(path, cfg)
+    load_config(path)
+}
+
+fn elegido(host: String, path: String) -> int {
+    let r: Array = vhost_pick(host, path)
+    let i: int = r[0]
+    return i
+}
+
+fn test_comodin_cubre_una_etiqueta() {
+    assert(elegido("acme.nyxerp.test", "/") == 0, "acme.nyxerp.test → comodín")
+    assert(elegido("x.nyxerp.test", "/pos") == 0, "una etiqueta de un carácter también")
+    print("PASS: *.dominio cubre <cliente>.dominio")
+}
+
+fn test_exacto_gana_aunque_el_comodin_vaya_antes() {
+    assert(elegido("demo.nyxerp.test", "/") == 2, "demo.nyxerp.test sigue en su upstream exacto")
+    assert(elegido("demo.nyxerp.test", "/api/x") == 2, "el /api del comodín no le gana al exacto")
+    assert(elegido("nyxerp.test", "/") == 3, "la raíz sigue en el suyo")
+    print("PASS: las rutas exactas van antes que el comodín, sin importar el orden")
+}
+
+fn test_lo_que_el_certificado_no_cubre() {
+    assert(elegido("a.b.nyxerp.test", "/") == -1, "dos etiquetas: el comodín no calza")
+    assert(elegido(".nyxerp.test", "/") == -1, "etiqueta vacía: no calza")
+    assert(elegido("acmenyxerp.test", "/") == -1, "sin el punto: no calza")
+    assert(elegido("acme.nyxerp.test.evil", "/") == -1, "sufijo con cola: no calza")
+    print("PASS: ni la raíz, ni dos etiquetas, ni sufijos parecidos")
+}
+
+fn test_path_prefix_bajo_el_comodin() {
+    let r: Array = vhost_pick("acme.nyxerp.test", "/api/ventas")
+    let i: int = r[0]
+    let n: int = r[1]
+    assert(i == 1, "el prefix más largo gana también bajo el comodín")
+    assert(n == 4, "largo del prefix /api")
+    print("PASS: path_prefix bajo un hostname comodín")
+}
+
+fn test_patron_invalido_no_se_registra() {
+    var i: int = 0
+    var visto: int = 0
+    while i < g_vhost_count {
+        let v: String = g_vhost_names[i]
+        if v == "a*.otro.test" { visto = 1 }
+        i = i + 1
+    }
+    assert(visto == 0, "a*.otro.test no queda como vhost")
+    assert(g_vhost_count == 4, "quedan los 4 hostnames válidos")
+    print("PASS: un comodín fuera de la primera etiqueta se ignora con aviso")
+}
+
+// Upstream que contesta su nombre: el pedido de punta a punta tiene que llegar acá.
+fn up_comodin() -> int {
+    let c: int = tcp_accept(g_srv[0])
+    var linea: String = tcp_read_line(c)
+    while linea.length() > 0 {
+        linea = tcp_read_line(c)
+    }
+    tcp_write(c, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nclientes")
+    tcp_close(c)
+    return 0
+}
+
+fn test_punta_a_punta_por_proxy_dispatch() {
+    let req: Array = ["request", "GET", "/", ["Host", "acme.nyxerp.test:443"], ""]
+    let resp: String = proxy_dispatch_c(req, 0, -1)
+    assert(resp.indexOf("HTTP/1.1 200") == 0, "el pedido comodín llega al upstream (" + resp.substring(0, 12) + ")")
+    assert(resp.endsWith("clientes"), "y contesta el upstream del comodín")
+    // demo va a su upstream exacto (muerto): 502, no el eco del comodín.
+    let req2: Array = ["request", "GET", "/", ["Host", "demo.nyxerp.test"], ""]
+    let resp2: String = proxy_dispatch_c(req2, 0, -1)
+    assert(resp2.indexOf("HTTP/1.1 502") == 0, "demo.nyxerp.test no cae en el comodín (" + resp2.substring(0, 12) + ")")
+    print("PASS: proxy_dispatch rutea por el comodín de punta a punta")
+}
+
+fn main() -> int {
+    config_de_prueba()
+    test_comodin_cubre_una_etiqueta()
+    test_exacto_gana_aunque_el_comodin_vaya_antes()
+    test_lo_que_el_certificado_no_cubre()
+    test_path_prefix_bajo_el_comodin()
+    test_patron_invalido_no_se_registra()
+
+    g_srv[0] = tcp_listen("127.0.0.1", PUERTO_COMODIN)
+    thread_spawn(up_comodin)
+    test_punta_a_punta_por_proxy_dispatch()
+    return 0
+}
