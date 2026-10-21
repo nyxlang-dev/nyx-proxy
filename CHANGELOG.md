@@ -3,6 +3,21 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.11 — 2026-10-21
+
+**El tope de upstreams sube de 16 a 128, y pasarlo avisa en vez de callar.**
+
+Hasta acá el 16 estaba repetido en `config.nx` (el loop de carga), `router.nx`
+(los pools) y `health.nx` (los contadores), y un `[upstream.16]` se ignoraba en
+silencio. El gateway de producción ya usa 13.
+
+- `src/config.nx` — **nuevo**: `MAX_UPSTREAMS` (128) y `MAX_BACKENDS` (16), una
+  sola fuente para los tres módulos. Si el `proxy.toml` declara
+  `upstream.128`, la carga lo dice.
+- Test: caso nuevo en `tests/test_proxy_config_listen.nx` (40 upstreams; el 39
+  rutea a su índice y existe su pool).
+- Sin cambio de firma en funciones públicas.
+
 ## v0.4.10 — 2026-10-21
 
 **Hostname comodín de una etiqueta: `hostname = "*.dominio"` en un `[upstream]`.**

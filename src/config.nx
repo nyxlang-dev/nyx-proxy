@@ -34,6 +34,15 @@ var g_metrics_enabled: int = 0
 var g_metrics_bind: String = "127.0.0.1"
 var g_metrics_port: int = 9090
 
+// Tope de upstreams de un proxy.toml. Hasta v0.4.10 era 16 fijo, repetido en
+// config, pools y health, y el upstream 17.º se ignoraba en silencio: el gateway
+// de producción ya usaba 13. Una sola constante para los tres, y un aviso al
+// cargar si el archivo declara más (ver load_config).
+const MAX_UPSTREAMS: int = 128
+// Backends por upstream que cubren los contadores de health (hoy cada upstream
+// declara uno solo).
+const MAX_BACKENDS: int = 16
+
 // Virtual host routing: hostname → upstream index
 var g_vhost_names: Array = []
 var g_vhost_indices: Array = []
@@ -85,9 +94,9 @@ pub fn load_config(path: String) {
     g_listen_port = toml_get_int(parsed, "server.listen", 8080)
     g_workers = toml_get_int(parsed, "server.workers", 64)
 
-    // Iterate upstream.0, upstream.1, ... (max 16)
+    // Iterate upstream.0, upstream.1, ... up to MAX_UPSTREAMS
     var idx: int = 0
-    while idx < 16 {
+    while idx < MAX_UPSTREAMS {
         let name_key: String = "upstream." + int_to_string(idx) + ".name"
         if toml_has(parsed, name_key) == false {
             break
@@ -125,6 +134,9 @@ pub fn load_config(path: String) {
 
         g_upstream_count = g_upstream_count + 1
         idx = idx + 1
+    }
+    if toml_has(parsed, "upstream." + int_to_string(MAX_UPSTREAMS) + ".name") {
+        println("nyx-proxy: " + path + " declara más de " + int_to_string(MAX_UPSTREAMS) + " upstreams; desde upstream." + int_to_string(MAX_UPSTREAMS) + " se ignoran")
     }
 
     g_upstream_idle_s = toml_get_int(parsed, "server.upstream_idle_timeout", 10)

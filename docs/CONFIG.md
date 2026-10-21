@@ -28,7 +28,7 @@ listener are the **consumer's** code, not the library's — see
 
 ## `[upstream.N]`
 
-One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2, ...).
+One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2, ...), contiguous from 0 and at most 128 blocks (v0.4.11+; 16 before). Loading stops at the first missing index.
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|

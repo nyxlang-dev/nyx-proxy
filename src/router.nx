@@ -14,7 +14,7 @@ import "src/metrics"
 // NO API estable: la API del consumer es proxy_dispatch(_c), ws_proxy y los
 // setters de configuración (sse_set_max_tunnels, upstream_set_close_timeout).
 //
-// Connection pools: one array of fds per upstream (max 16 upstreams).
+// Connection pools: one array of fds per upstream (MAX_UPSTREAMS, config.nx).
 // `g_pool_exp` es paralelo a `g_pools`: para cada fd, el instante (monotonic_us)
 // en que deja de poder reutilizarse. Se apilan y desapilan juntos bajo el mutex.
 var g_pools: Array = []
@@ -26,7 +26,7 @@ pub fn pool_init() {
     if g_pools_init == 1 { return 0 }
     g_pool_mtx = mutex_new()
     var i: int = 0
-    while i < 16 {
+    while i < MAX_UPSTREAMS {
         let pool: Array = []
         g_pools.push(pool)
         let exp: Array = []

@@ -11,6 +11,13 @@
 // Correr con NYX_PROJECT_DIR=<stack> (importa "src/config").
 
 import "src/config"
+import "std/http"
+import "std/proxy"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/metrics"
 
 fn test_tls_explicit_listen_respected() {
     let path: String = "/tmp/nyx_proxy_test_listen_explicit.toml"
@@ -59,6 +66,28 @@ fn test_plain_http_listen_untouched() {
     print("PASS: HTTP plano respeta listen = 9090 (sin regresion)")
 }
 
+// Hasta v0.4.10 el tope era 16 fijo y el upstream 17.º se ignoraba sin aviso
+// (el gateway ya usaba 13). Se mide el ÍNDICE más alto que quedó cargado y que
+// su pool exista, no solo que la carga no falle.
+fn test_mas_de_16_upstreams() {
+    let path: String = "/tmp/nyx_proxy_test_many_upstreams.toml"
+    var cfg: String = "[server]\nlisten = 8080\n"
+    var i: int = 0
+    while i < 40 {
+        cfg = cfg + "\n[upstream." + int_to_string(i) + "]\nname = \"u" + int_to_string(i) + "\"\nhostname = \"h" + int_to_string(i) + ".test\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(9200 + i) + "\n"
+        i = i + 1
+    }
+    write_file(path, cfg)
+    load_config(path)
+    assert(g_upstream_count == 40, "los 40 upstreams quedan cargados")
+    let r: Array = vhost_pick("h39.test", "/")
+    let idx: int = r[0]
+    assert(idx == 39, "el upstream 39 rutea a su índice")
+    pool_init()
+    assert(g_pools.length() == MAX_UPSTREAMS, "un pool por upstream posible")
+    print("PASS: más de 16 upstreams se cargan y rutean (tope MAX_UPSTREAMS)")
+}
+
 fn main() -> int {
     // Orden a propósito: el caso "default fuerza 443" corre DESPUÉS del
     // explícito — load_config re-lee listen del toml en cada llamada, así
@@ -66,6 +95,7 @@ fn main() -> int {
     test_tls_explicit_listen_respected()
     test_tls_default_listen_forces_443()
     test_plain_http_listen_untouched()
+    test_mas_de_16_upstreams()
     print("")
     print("ALL nyx-proxy config-listen tests passed")
     return 0
