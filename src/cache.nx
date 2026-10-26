@@ -196,7 +196,13 @@ fn _parse_max_age(cc: String) -> int {
         }
     }
     if digits.length() == 0 { return -1 }
-    return string_to_int(digits)
+    // RFC 9111 §1.2.2: un delta-seconds más grande de lo que se puede
+    // representar vale 2^31. El tope también evita que `now + ttl` desborde, y
+    // string_to_int abortaría el proxy por un header del upstream (desde Nyx
+    // 0.38.0 un número que no entra en 64 bits es inválido, no se satura).
+    let secs: int = string_to_int_or(digits, 2147483648)
+    if secs > 2147483648 { return 2147483648 }
+    return secs
 }
 
 // Lee el valor del header Cache-Control directamente del String de la
@@ -226,7 +232,8 @@ fn _extract_cache_control(resp: String) -> String {
 fn _extract_status(resp: String) -> int {
     if resp.length() < 12 { return 0 }
     let s: String = resp.substring(9, 12)
-    return string_to_int(s)
+    // Lo manda el upstream: un status que no es número es 0, no un abort.
+    return string_to_int_or(s, 0)
 }
 
 // Intenta cachear el response. Parsea status + Cache-Control internamente.

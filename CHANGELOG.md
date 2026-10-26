@@ -3,6 +3,24 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.12 — 2026-10-26
+
+**Un header del upstream con un número enorme o inválido ya no tumba el proxy.**
+
+Desde Nyx 0.38.0, `string_to_int` aborta el proceso ante un número que no entra en
+64 bits (antes lo saturaba en silencio). El proxy le pasaba datos del upstream
+validando solo que fueran dígitos:
+
+- `src/cache.nx` — `max-age` de `Cache-Control`: uno de 20 dígitos vale 2^31 s,
+  como manda RFC 9111 §1.2.2, y ese tope también evita que `now + ttl` desborde.
+  El status de la respuesta que no es número (`HTTP/1.1 abc`) es 0 y no se
+  cachea; eso ya abortaba antes de 0.38.0.
+- `src/router.nx` — `Keep-Alive: timeout=` que desborda no acota el ocio
+  (queda el configurado); el status del access log que no es número es 0.
+- Tests: dos casos en `tests/test_proxy_cache.nx` y uno en
+  `tests/test_proxy_pool_idle.nx`. Los tres fallan con el código anterior.
+- Sin cambio de firma en funciones públicas.
+
 ## v0.4.11 — 2026-10-21
 
 **El tope de upstreams sube de 16 a 128, y pasarlo avisa en vez de callar.**

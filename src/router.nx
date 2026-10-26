@@ -153,7 +153,9 @@ fn keepalive_timeout_of(ka: String) -> int {
                 }
                 j = j + 1
             }
-            return string_to_int(v)
+            // Solo dígitos, pero puede no entrar en 64 bits: entonces no acota
+            // (-1, como ausente) en vez de abortar el proxy.
+            return string_to_int_or(v, -1)
         }
         i = i + 1
     }
@@ -1544,7 +1546,7 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     if resp.length() > 12 {
         // "HTTP/1.1 NNN" — status at positions 9-11
         let status_str: String = resp.substring(9, 12)
-        log_status = string_to_int(status_str)
+        log_status = string_to_int_or(status_str, 0)   // lo manda el upstream
     }
     access_log(method, path, log_status, t1 - t0)
 

@@ -225,6 +225,22 @@ fn test_keep_alive_timeout_1_no_entra_al_pool() {
     print("PASS pool: Keep-Alive: timeout=1 no deja la conexión en el pool")
 }
 
+// `timeout=` de 20 dígitos (no entra en 64 bits): no acota el ocio —queda el
+// configurado— y la conexión se reutiliza. Antes de este arreglo abortaba el
+// proxy (string_to_int sobre un header del upstream, Nyx 0.38.0).
+fn test_keep_alive_timeout_que_desborda_no_acota() {
+    let b: Backend = levantar(19415, "Keep-Alive: timeout=99999999999999999999")
+    let tid: int = thread_spawn(up_mira_la_vieja)
+    let r1: String = forward_pooled(6, "GET", "/", h(), "", b)
+    sleep(500)
+    let r2: String = forward_pooled(6, "GET", "/", h(), "", b)
+    thread_join(tid)
+    tcp_close(g_srv[0])
+    assert(r1.endsWith("ok") and r2.endsWith("ok"), "los dos pedidos salen bien")
+    assert(g_estado[0] == 2, "un timeout que desborda no acota: la conexión se reutiliza")
+    print("PASS pool: Keep-Alive: timeout que no entra en 64 bits no acota ni aborta")
+}
+
 fn main() -> int {
     pool_init()
     test_post_tras_cierre_ocioso_da_200_y_llega_una_vez()
@@ -232,5 +248,6 @@ fn main() -> int {
     test_keep_alive_timeout_del_upstream_acota_el_ocio()
     test_dentro_del_plazo_se_reutiliza()
     test_keep_alive_timeout_1_no_entra_al_pool()
+    test_keep_alive_timeout_que_desborda_no_acota()
     return 0
 }

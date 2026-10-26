@@ -84,6 +84,18 @@ fn test_honor_max_age() {
     let hit: String = cache_lookup("example.com", "/short")
     assert(hit.indexOf("short-lived") >= 0)
     print("PASS: max-age=60 cachea correctamente")
+
+    // Un max-age de 20 dígitos (no entra en 64 bits) vale 2^31 s: se cachea
+    // en vez de abortar el proceso por un header del upstream.
+    let big: String = mk_response(200, "Cache-Control: max-age=99999999999999999999", "huge-ttl")
+    assert(cache_try_store("example.com", "/huge", big) == 1)
+    assert(cache_lookup("example.com", "/huge").indexOf("huge-ttl") >= 0)
+    print("PASS: max-age de 20 dígitos se cachea con 2^31 s")
+
+    // Un status que no es número no se cachea y no aborta.
+    let raro: String = "HTTP/1.1 abc OK\r\nCache-Control: max-age=60\r\nContent-Length: 2\r\n\r\nok"
+    assert(cache_try_store("example.com", "/raro", raro) == 0)
+    print("PASS: status no numérico no se cachea")
 }
 
 fn test_eviction_lru() {
