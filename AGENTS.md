@@ -42,6 +42,7 @@ re-vendorizar, commitear el pin, recompilar y reiniciar el servicio.
 | Módulo | Qué hace |
 |---|---|
 | `config.nx` | parsea `proxy.toml`: upstreams, vhosts, health, rate, TLS, cache, metrics |
+| `h2front.nx` | HTTP/2 hacia el cliente (ALPN `h2`): un bucle por conexión, peticiones por hilo auxiliar, SSE bombeado por el bucle. El protocolo es de `std/http2` |
 | `router.nx` | **el corazón** (~1000 líneas): pool de conexiones, encuadre de la respuesta, `proxy_dispatch`, `ws_proxy`/`ws_tunnel` |
 | `health.nx` | health checks TCP activos con umbral de fallos |
 | `logger.nx` | access logs |
@@ -111,6 +112,11 @@ agregás un camino de salida a `read_upstream_response_*`, decidí explícitamen
 Y al SALIR del pool, un fd se sondea antes de usarse (read de plazo 0) y se
 descarta si venció su ocio: desde v0.4.9, porque un upstream que ya cerró la conexión ociosa
 recibía el write sin error y el POST terminaba en 502 (no se reintenta, y está bien que no).
+
+**En una conexión HTTP/2 solo el bucle escribe al cliente** (`h2front.nx`). Un hilo auxiliar deja
+su resultado en el buzón y despierta al bucle por el pipe; nunca toca el `ssl_handle`. Por eso ahí
+no hay candado sobre el `SSL*`, y agregar un segundo escritor lo rompe. Un fd de SSE diferido
+(`proxy_dispatch_o`) es de quien llamó: lo cierra y después `sse_slot_release()`, siempre en par.
 
 **No hay HTTP/2 al upstream** (solo HTTP/1.1), el cache **ignora `Vary`** (la clave es
 `host:path`) y los health checks son **solo TCP**.

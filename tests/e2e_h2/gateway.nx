@@ -1,0 +1,85 @@
+// Gateway mínimo de la prueba e2e de HTTP/2: el mismo bucle de trabajadores que
+// examples/gateway-tls, sin redirect ni SNI. Uso: ./gateway <proxy.toml>
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/h2front"
+
+var g_ch: Map = Map.new()
+
+fn worker() -> int {
+    while 1 > 0 {
+        let client_fd: int = channel_recv(g_ch)
+        if client_fd < 0 { return 0 }
+        let client_ip: String = getpeername(client_fd)
+        let ssl: int = tls_accept(client_fd)
+        if ssl == 0 {
+            tcp_close(client_fd)
+        } else if proxy_h2_negotiated(ssl) {
+            proxy_h2_spawn_conn(ssl, client_ip)
+        } else {
+            // HTTP/1.1: una petición y se cierra (alcanza para la prueba).
+            let request_line: String = tls_read_line(ssl)
+            let parts: Array = request_line.split(" ")
+            if parts.length() >= 2 {
+                let method: String = parts[0]
+                let path: String = parts[1]
+                var headers: Array = []
+                var done: int = 0
+                while done == 0 {
+                    let hline: String = tls_read_line(ssl)
+                    if hline.length() == 0 {
+                        done = 1
+                    } else {
+                        let c: int = hline.indexOf(": ")
+                        if c >= 0 {
+                            headers.push(hline.substring(0, c))
+                            headers.push(hline.substring(c + 2, hline.length()))
+                        }
+                    }
+                }
+                let request: Array = ["request", method, path, inject_forwarded_headers(headers, client_ip), ""]
+                let resp: String = proxy_dispatch_c(request, ssl, -1)
+                if resp.length() > 0 { tls_write_conn(ssl, resp) }
+            }
+            tls_close_conn(ssl)
+        }
+    }
+    return 0
+}
+
+fn main() -> int {
+    let args: Array = get_args()
+    if args.length() < 2 {
+        print("uso: gateway <proxy.toml>")
+        return 2
+    }
+    let cfg: String = args[1]
+    load_config(cfg)
+    if tls_server_init(g_tls_cert, g_tls_key) < 0 {
+        print("ERROR: TLS init")
+        return 1
+    }
+    let h2: int = proxy_h2_init()
+    print("gateway de prueba en " + int_to_string(g_listen_port) + " http2=" + int_to_string(h2))
+    g_ch = channel_new(256)
+    let server: int = tcp_listen("127.0.0.1", g_listen_port)
+    if server < 0 {
+        print("ERROR: listen")
+        return 1
+    }
+    var i: int = 0
+    while i < g_workers {
+        thread_spawn(worker)
+        i = i + 1
+    }
+    while 1 > 0 {
+        let c: int = tcp_accept(server)
+        if c >= 0 { channel_send(g_ch, c) }
+    }
+    return 0
+}

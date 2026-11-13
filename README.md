@@ -158,7 +158,7 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 
 | Section | Purpose |
 |---------|---------|
-| `[server]` | `listen`, `workers`, `rate_limit`, `health_check_interval`, `health_check_threshold`, `access_log`, `tls_cert`, `tls_key` |
+| `[server]` | `listen`, `workers`, `rate_limit`, `health_check_interval`, `health_check_threshold`, `access_log`, `tls_cert`, `tls_key`, `http2` (v0.4.13+) |
 | `[upstream.N]` | `name`, `host`, `port`, optional `hostname` (vhost, exact or `*.domain`) or `path_prefix` |
 | `[cache]` | `enabled`, `max_entries`, `default_ttl_seconds` (v0.3+) |
 | `[metrics]` | `enabled`, `bind`, `port` (v0.3+) |
@@ -172,7 +172,7 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 
 ## Limitations
 
-- HTTP/1.1 to backends only — no HTTP/2 upstream
+- HTTP/1.1 to backends only — no HTTP/2 upstream. Toward clients, HTTP/2 is opt-in (`http2 = true`, v0.4.13+)
 - WebSocket passthrough terminates TLS at the proxy; the upstream leg is plain TCP
 - Health checks are TCP-only (no HTTP endpoint probing)
 - Response cache ignores `Vary` header (cache key is `host:path` only)

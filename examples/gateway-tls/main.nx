@@ -27,6 +27,7 @@ import "nyx-proxy/src/ratelimit"
 import "nyx-proxy/src/cache"
 import "nyx-proxy/src/metrics"
 import "nyx-proxy/src/admin"
+import "nyx-proxy/src/h2front"
 
 // Channel for dispatching accepted client fds to TLS workers
 var g_proxy_ch: Map = Map.new()
@@ -105,7 +106,14 @@ fn tls_worker() -> int {
         if ssl_handle == 0 {
             tcp_close(client_fd)
         } else {
-            var keep_alive: bool = true
+            // HTTP/2 (server.http2 = true y el cliente lo negoció por ALPN):
+            // la conexión pasa a un hilo propio, que la atiende entera y
+            // cierra el handle. Este trabajador queda libre.
+            let es_h2: bool = proxy_h2_negotiated(ssl_handle)
+            if es_h2 {
+                proxy_h2_spawn_conn(ssl_handle, client_ip)
+            }
+            var keep_alive: bool = not es_h2
             while keep_alive {
                 let request_line: String = tls_read_line(ssl_handle)
                 if request_line.length() == 0 {
@@ -192,7 +200,9 @@ fn tls_worker() -> int {
                     }
                 }
             }
-            tls_close_conn(ssl_handle)
+            if not es_h2 {
+                tls_close_conn(ssl_handle)
+            }
         }
     }
     return 0
@@ -241,6 +251,12 @@ fn main() {
     // SNI: one cert per additional domain this gateway serves.
     // Deployment-specific by design — replace with your domains.
     tls_server_add_cert("api.example.com", "certs/api.example.com.pem", "certs/api.example.com.key")
+
+    // HTTP/2 hacia el cliente si proxy.toml dice `http2 = true`. Va DESPUÉS de
+    // cargar todos los certificados.
+    if proxy_h2_init() == 1 {
+        print("HTTP/2 enabled (ALPN h2)")
+    }
 
     print("gateway-tls (HTTPS, SNI)")
     print("Listening on port " + int_to_string(g_listen_port) + " with " + int_to_string(g_workers) + " workers")

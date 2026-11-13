@@ -1,0 +1,65 @@
+// Backend de la prueba e2e de HTTP/2: el servidor del reporte de nyxerp (un
+// canal SSE por pantalla) más rutas para medir lo que importa.
+// Uso: ./backend <puerto>
+import "std/web"
+import "std/serve"
+
+fn avisos(req: Request) -> Response { return sse_open(req, "sala") }
+fn hola(_req: Request) -> Response { return response_new(200, "hola") }
+fn lento(_req: Request) -> Response {
+    sleep(1500)
+    return response_new(200, "lento")
+}
+fn eco(req: Request) -> Response { return response_new(200, req.body) }
+fn grande(_req: Request) -> Response {
+    return response_new(200, "0123456789abcdef".repeat(64 * 293))
+}
+fn cab(req: Request, nombre: String) -> String {
+    var i: int = 0
+    while i + 1 < req.headers_flat.length() {
+        let k: String = req.headers_flat[i]
+        if k.toLower() == nombre {
+            let v: String = req.headers_flat[i + 1]
+            return v
+        }
+        i = i + 2
+    }
+    return ""
+}
+fn cabeceras(req: Request) -> Response {
+    var txt: String = "proto=" + cab(req, "x-forwarded-proto")
+    txt = txt + " cookie=" + cab(req, "cookie")
+    txt = txt + " xff=" + cab(req, "x-forwarded-for")
+    return response_new(200, txt)
+}
+
+fn cuenta(_req: Request) -> Response { return response_new(200, int_to_string(sse_count())) }
+
+fn latido() -> int {
+    var n: int = 0
+    while true {
+        sleep(200)
+        n = n + 1
+        sse_broadcast("sala", "tick", int_to_string(n))
+    }
+    return 0
+}
+
+fn main() -> int {
+    let args: Array = get_args()
+    var port: int = 4898
+    if args.length() > 1 {
+        let p: String = args[1]
+        port = string_to_int(p)
+    }
+    var app: App = app_new()
+    app_get(app, "/avisos", avisos)
+    app_get(app, "/hola", hola)
+    app_get(app, "/lento", lento)
+    app_get(app, "/grande", grande)
+    app_get(app, "/cabeceras", cabeceras)
+    app_get(app, "/cuenta", cuenta)
+    app_post(app, "/eco", eco)
+    thread_spawn(latido)
+    return serve_app_en(app, "127.0.0.1", port, 16)
+}

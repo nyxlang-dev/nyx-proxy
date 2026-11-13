@@ -30,6 +30,7 @@ lado la mencionaba.
 | `briefs/_recibidos/2026-09-14-serve-sse-task-6.md` — túnel SSE | repo del lenguaje, rama `arc/serve-sse` | **respondido** el 2026-09-20 (v0.4.4, desplegado) |
 | `briefs/_recibidos/2026-09-24-nyx1036-pub.md` — avisos NYX1036 en tests | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.7): report al pie del encargo |
 | `briefs/_recibidos/2026-09-24-nyxerp-forwarded.md` — X-Forwarded-Host/Proto al upstream | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.8): report al pie del encargo; falta re-vendorizar el gateway (lo hace el lenguaje) |
+| `briefs/_recibidos/2026-11-13-gateway-http2.md` — HTTP/2 hacia el navegador, SSE como flujo | repo del lenguaje, arco `gateway-http2` | **respondido** el 2026-11-13 (v0.4.13): report al pie; activarlo en el gateway de producción espera la confirmación del dueño |
 | `briefs/_recibidos/2026-09-25-pool-idle.md` — el pool reutiliza conexiones ya cerradas (502 en POST) | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-25 (v0.4.9): report al pie; vendor y deploy del gateway los coordina el lenguaje |
 
 ## Pendientes (sin arco todavía)

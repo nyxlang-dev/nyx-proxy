@@ -17,6 +17,10 @@ Configuration is read from `proxy.toml` in the working directory at startup.
 | `upstream_idle_timeout` | int | `10` | Seconds an idle keep-alive connection to an upstream may wait in the pool before it is closed instead of reused (v0.4.9+). Keep it **below** the upstreams' own idle timeout (`std/serve` closes at 15 s). An upstream's `Keep-Alive: timeout=N` lowers it to `N-1` for that connection. `0` disables reuse. Reloads with the config. |
 | `tls_cert` | string | — | Path to TLS certificate (PEM). Setting it enables TLS mode. |
 | `tls_key` | string | — | Path to TLS private key (PEM). Required for TLS mode. |
+| `http2` | bool | `false` | Offer HTTP/2 to clients on the TLS port (ALPN `h2`), v0.4.13+. Upstreams are still reached over HTTP/1.1. A browser then uses ONE connection with up to 100 streams instead of 6 connections per domain — which matters as soon as pages keep SSE channels open. The gateway's `main` must call `proxy_h2_init()` after loading its certificates and hand `h2` connections to `proxy_h2_spawn_conn` (see `examples/gateway-tls/main.nx`). Clients without HTTP/2 keep working over HTTP/1.1. WebSocket still uses a separate HTTP/1.1 connection. Not hot-reloaded: restart to change it. |
+| `http2_max_body` | int | `16777216` | Largest request body accepted over HTTP/2, in bytes; beyond it the client gets `413`. |
+| `http2_idle_timeout` | int | `120` | Seconds an HTTP/2 connection with no open streams is kept before it is closed. A connection with an SSE channel open is never idle. |
+| `http2_max_inflight` | int | `64` | Requests of ONE connection being forwarded at the same time (each uses a thread while the upstream answers). Beyond it the request gets `503` with `Retry-After: 1`. SSE channels do not count. |
 
 Setting `tls_cert`/`tls_key` enables TLS mode in the config globals. The
 accept loop, SNI certificate registration and any HTTP→HTTPS redirect

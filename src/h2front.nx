@@ -1,0 +1,470 @@
+// h2front.nx — HTTP/2 hacia el cliente (ALPN "h2"), HTTP/1.1 hacia el upstream.
+//
+// Por qué existe: con HTTP/1.1 un navegador abre como mucho 6 conexiones por
+// dominio, compartidas entre todas sus pestañas, y cada canal SSE ocupa una
+// para siempre. Con seis pantallas abiertas la séptima petición espera en la
+// cola del navegador aunque el servidor responda en milisegundos. Con HTTP/2
+// todo viaja por UNA conexión con decenas de flujos.
+//
+// Cómo se reparte el trabajo en una conexión:
+//
+//   - El BUCLE de la conexión (proxy_h2_serve_conn) es el único que lee y
+//     escribe el TLS del cliente. No hay candado sobre el `SSL*` porque no hay
+//     un segundo escritor.
+//   - Una petición común se despacha en un HILO AUXILIAR por el router de
+//     siempre (proxy_dispatch_o: cache, health, reintentos, pool), que es
+//     bloqueante. Al terminar deja la respuesta en un buzón y despierta al
+//     bucle por un pipe. Una petición lenta no frena a las demás.
+//   - Un canal SSE NO gasta hilo: el router devuelve el fd del upstream y el
+//     bucle lo suma a su `poll`. Cada trozo que llega sale como un frame DATA
+//     del flujo, sin almacenarse.
+//
+// El protocolo (HPACK, control de flujo, validación de cabeceras, topes contra
+// rapid reset y demás abusos) es de std/http2; acá solo se decide qué hacer
+// con cada petición.
+//
+// Lo que NO hay: WebSocket sobre HTTP/2 (el navegador abre el WebSocket por una
+// conexión HTTP/1.1 aparte, como siempre) ni cuerpo de subida por partes (se
+// junta entero, con tope `server.http2_max_body`).
+
+import "std/http"
+import "std/http2"
+import "std/tls"
+import "std/net"
+import "std/sync"
+import "src/config"
+import "src/router"
+import "src/ratelimit"
+
+// Un flujo deja de leerse de su upstream SSE mientras tenga más de esto
+// encolado sin que el cliente lo deje salir (control de flujo): el atraso se
+// le traslada al upstream en vez de crecer en memoria.
+const H2F_SSE_BACKLOG: int = 262144
+
+// Conexiones HTTP/2 abiertas ahora (diagnóstico y tests).
+var g_h2_conns: Array = [0]
+var g_h2_mtx: Map = Map.new()
+var g_h2_mtx_init: int = 0
+
+// Llamar UNA vez desde main, antes de lanzar los trabajadores: activa ALPN en
+// el servidor TLS (después de tls_server_init y de los tls_server_add_cert) si
+// `server.http2 = true`. Devuelve 1 si HTTP/2 quedó activo.
+pub fn proxy_h2_init() -> int {
+    if g_h2_mtx_init == 0 {
+        g_h2_mtx = mutex_new()
+        g_h2_mtx_init = 1
+    }
+    if g_http2_enabled == 0 {
+        return 0
+    }
+    if not tls_server_alpn("h2,http/1.1") {
+        return 0
+    }
+    return 1
+}
+
+pub fn proxy_h2_open_conns() -> int {
+    if g_h2_mtx_init == 0 { return 0 }
+    mutex_lock(g_h2_mtx)
+    let n: int = g_h2_conns[0]
+    mutex_unlock(g_h2_mtx)
+    return n
+}
+
+fn h2f_conns_add(delta: int) {
+    if g_h2_mtx_init == 0 { return 0 }
+    mutex_lock(g_h2_mtx)
+    g_h2_conns[0] = g_h2_conns[0] + delta
+    mutex_unlock(g_h2_mtx)
+    return 0
+}
+
+// ¿Esta conexión TLS recién aceptada negoció HTTP/2?
+pub fn proxy_h2_negotiated(ssl_handle: int) -> bool {
+    if g_http2_enabled == 0 { return false }
+    return tls_alpn(ssl_handle) == "h2"
+}
+
+// Una respuesta HTTP/1.1 entera (la que arma el router) partida en sus piezas:
+// [status, cabeceras en pares, cuerpo]. Todo por BYTES.
+fn h2f_parse_response(resp: String) -> Array {
+    var status: int = 502
+    var headers: Array = []
+    var body: String = ""
+    let total: int = str_byte_length(resp)
+    var head: String = resp
+    let fin: int = resp.indexOf("\r\n\r\n")
+    if fin >= 0 {
+        head = resp.substring(0, fin)
+        body = resp.substring(fin + 4, total)
+    }
+    let lines: Array = head.split("\r\n")
+    if lines.length() > 0 {
+        let sl: String = lines[0]
+        if str_byte_length(sl) >= 12 {
+            status = string_to_int_or(sl.substring(9, 12), 502)
+        }
+    }
+    var i: int = 1
+    while i < lines.length() {
+        let line: String = lines[i]
+        let c: int = line.indexOf(":")
+        if c > 0 {
+            let k: String = line.substring(0, c)
+            let v: String = line.substring(c + 1, str_byte_length(line))
+            headers.push(k.toLower())
+            headers.push(v.trim())
+        }
+        i = i + 1
+    }
+    return [status, headers, body]
+}
+
+// Las cabeceras de la petición HTTP/2 en la forma que espera el router: Host
+// desde :authority, y las `cookie` sueltas (HTTP/2 las puede partir, RFC 9113
+// §8.2.3) unidas en una sola.
+fn h2f_request_headers(req: H2Request, client_ip: String) -> Array {
+    var headers: Array = []
+    var host: String = req.authority
+    var cookie: String = ""
+    var i: int = 0
+    while i + 1 < req.headers.length() {
+        let k: String = req.headers[i]
+        let v: String = req.headers[i + 1]
+        if k == "host" {
+            if str_byte_length(host) == 0 { host = v }
+        } else if k == "cookie" {
+            if str_byte_length(cookie) > 0 { cookie = cookie + "; " }
+            cookie = cookie + v
+        } else {
+            headers.push(k)
+            headers.push(v)
+        }
+        i = i + 2
+    }
+    var out: Array = ["Host", host]
+    if str_byte_length(cookie) > 0 {
+        out.push("cookie")
+        out.push(cookie)
+    }
+    var j: int = 0
+    while j + 1 < headers.length() {
+        let hk: String = headers[j]
+        let hv: String = headers[j + 1]
+        out.push(hk)
+        out.push(hv)
+        j = j + 2
+    }
+    return inject_forwarded_headers(out, client_ip)
+}
+
+fn h2f_host_name(host: String) -> String {
+    let c: int = host.indexOf(":")
+    if c >= 0 { return host.substring(0, c) }
+    return host
+}
+
+// Despacha una petición en un hilo auxiliar. El resultado llega al buzón como
+// tres casillas: [flujo, respuesta, fd SSE o -1]. Devuelve el id del hilo.
+fn h2f_spawn(stream: int, request: Array, buzon: Array, mtx: Map, wake_w: int) -> int {
+    fn trabajo() -> int {
+        let diferido: Array = [-1, 1]
+        let resp: String = proxy_dispatch_o(request, 0, -1, diferido)
+        let sse_fd: int = diferido[0]
+        mutex_lock(mtx)
+        buzon.push(stream)
+        buzon.push(resp)
+        buzon.push(sse_fd)
+        mutex_unlock(mtx)
+        h2_wake_signal(wake_w)
+        return 0
+    }
+    return thread_spawn(trabajo)
+}
+
+fn h2f_index_of(xs: Array, x: int) -> int {
+    var i: int = 0
+    while i < xs.length() {
+        let v: int = xs[i]
+        if v == x { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn h2f_without(xs: Array, idx: int) -> Array {
+    var out: Array = []
+    var i: int = 0
+    while i < xs.length() {
+        if i != idx {
+            let v: int = xs[i]
+            out.push(v)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn h2f_sse_close(fd: int) {
+    tcp_shutdown(fd, 2)
+    tcp_close(fd)
+    sse_slot_release()
+    return 0
+}
+
+// Pasa al flujo lo que el upstream SSE tenga listo, sin esperar. true = el
+// canal terminó (EOF o error del upstream, o el cliente ya no está): el flujo
+// queda cerrado y falta cerrar el fd.
+fn h2f_sse_pump(sess: int, stream: int, fd: int) -> bool {
+    var fin: bool = false
+    match try_tcp_read_timed(fd, 65536, 0) {
+        Result.Ok(trozo) => {
+            if h2_send_data(sess, stream, trozo) < 0 { fin = true }
+        }
+        Result.Err(e) => {
+            // 110 = todavía nada; cualquier otro, EOF incluido, cierra.
+            if e.code != 110 { fin = true }
+        }
+    }
+    if fin {
+        h2_end(sess, stream)
+    }
+    return fin
+}
+
+// Lanza un hilo propio para una conexión HTTP/2 y vuelve enseguida: el
+// trabajador que la aceptó queda libre para la siguiente. Una conexión HTTP/2
+// dura minutos u horas (es una por navegador), y dejarla en un trabajador del
+// pool lo sacaría de circulación. El hilo cierra el handle al terminar.
+pub fn proxy_h2_spawn_conn(ssl_handle: int, client_ip: String) -> int {
+    fn conexion() -> int {
+        proxy_h2_serve_conn(ssl_handle, client_ip)
+        tls_close_conn(ssl_handle)
+        return 0
+    }
+    let tid: int = thread_spawn(conexion)
+    thread_detach(tid)
+    return 0
+}
+
+// Atiende una conexión TLS que negoció "h2" hasta que termine. NO cierra el
+// handle: `tls_close_conn` sigue siendo del que llama, como en el camino
+// HTTP/1.1.
+pub fn proxy_h2_serve_conn(ssl_handle: int, client_ip: String) -> int {
+    let sess: int = h2_session_new(g_http2_max_body)
+    let wake: Array = pipe_new()
+    if wake.length() < 2 {
+        return -1
+    }
+    let wake_r: int = wake[0]
+    let wake_w: int = wake[1]
+    let mtx: Map = mutex_new()
+    var buzon: Array = []
+
+    // Peticiones en vuelo: flujo e hilo, en paralelo.
+    var fl_streams: Array = []
+    var fl_tids: Array = []
+    // Canales SSE abiertos: flujo y fd del upstream, en paralelo.
+    var sse_streams: Array = []
+    var sse_fds: Array = []
+
+    h2f_conns_add(1)
+    var vivo: bool = true
+    var ocio_desde: int = time_epoch()
+
+    while vivo {
+        // 1. Lo que haya para el cliente. Comparar contra el largo esperado:
+        //    tls_write_conn puede devolver una escritura parcial.
+        let out: String = h2_take_output(sess)
+        let out_len: int = str_byte_length(out)
+        if out_len > 0 {
+            if tls_write_conn(ssl_handle, out) != out_len {
+                vivo = false
+            }
+        }
+        if vivo and h2_closed(sess) and fl_streams.length() == 0 {
+            vivo = false
+        }
+
+        // 2. Ocio: sin flujos ni peticiones en vuelo por `http2_idle_timeout`.
+        if vivo {
+            if h2_open_streams(sess) > 0 or fl_streams.length() > 0 {
+                ocio_desde = time_epoch()
+            } else if time_epoch() - ocio_desde >= g_http2_idle_s {
+                h2_goaway(sess)
+                let adios: String = h2_take_output(sess)
+                tls_write_conn(ssl_handle, adios)
+                vivo = false
+            }
+        }
+
+        if vivo {
+            // 3. Esperar: el cliente, el despertador y los SSE que tienen lugar.
+            var fds: Array = [wake_r]
+            var fds_stream: Array = [0]
+            var si: int = 0
+            while si < sse_streams.length() {
+                let s_stream: int = sse_streams[si]
+                if h2_pending(sess, s_stream) < H2F_SSE_BACKLOG {
+                    let s_fd: int = sse_fds[si]
+                    fds.push(s_fd)
+                    fds_stream.push(s_stream)
+                }
+                si = si + 1
+            }
+            let listo: Array = tls_wait_any(ssl_handle, fds, 1000)
+            let tls_estado: int = listo[0]
+            if tls_estado < 0 {
+                vivo = false
+            }
+
+            // 4. Bytes del cliente. Si wait dijo 1 hay que consumir, aunque el
+            //    read vuelva vacío (un record de control TLS): es lo que deja
+            //    ver el EOF en la vuelta siguiente.
+            if vivo and tls_estado == 1 {
+                let data: String = tls_read_nonblock(ssl_handle, 16384)
+                if str_byte_length(data) > 0 {
+                    h2_feed(sess, data)
+                    var mas: bool = true
+                    while mas {
+                        let ev: Array = h2_next_event(sess)
+                        let kind: int = h2_event_kind(ev)
+                        if kind == H2_EV_NONE {
+                            mas = false
+                        } else if kind == H2_EV_REQUEST {
+                            let req: H2Request = h2_event_request(ev)
+                            let headers: Array = h2f_request_headers(req, client_ip)
+                            let host_raw: String = headers[1]
+                            let rl: String = proxy_check_rate(client_ip, h2f_host_name(host_raw))
+                            if str_byte_length(rl) > 0 {
+                                let pr: Array = h2f_parse_response(rl)
+                                let pr_st: int = pr[0]
+                                let pr_h: Array = pr[1]
+                                let pr_b: String = pr[2]
+                                h2_respond(sess, req.stream, pr_st, pr_h, pr_b)
+                            } else if fl_streams.length() >= g_http2_max_inflight {
+                                // Tope de hilos por conexión: se contesta sin
+                                // tocar el upstream.
+                                let lleno: Array = ["content-type", "text/plain", "retry-after", "1"]
+                                h2_respond(sess, req.stream, 503, lleno, "Service Unavailable: too many requests in flight")
+                            } else {
+                                let request: Array = ["request", req.method, req.path, headers, req.body]
+                                let tid: int = h2f_spawn(req.stream, request, buzon, mtx, wake_w)
+                                fl_streams.push(req.stream)
+                                fl_tids.push(tid)
+                            }
+                        } else if kind == H2_EV_CANCEL {
+                            // El cliente canceló. Un SSE se corta ya; una
+                            // petición en vuelo se descarta cuando su hilo vuelva.
+                            let c_stream: int = h2_event_stream(ev)
+                            let c_idx: int = h2f_index_of(sse_streams, c_stream)
+                            if c_idx >= 0 {
+                                let c_fd: int = sse_fds[c_idx]
+                                h2f_sse_close(c_fd)
+                                sse_streams = h2f_without(sse_streams, c_idx)
+                                sse_fds = h2f_without(sse_fds, c_idx)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. Lo demás que quedó listo: el despertador (índice 0) y los SSE.
+            var li: int = 1
+            while vivo and li < listo.length() {
+                let idx: int = listo[li]
+                if idx == 0 {
+                    h2_wake_drain(wake_r)
+                    mutex_lock(mtx)
+                    var llegados: Array = []
+                    while buzon.length() > 0 {
+                        llegados.push(buzon.shift())
+                    }
+                    mutex_unlock(mtx)
+                    var bi: int = 0
+                    while bi + 2 < llegados.length() {
+                        let r_stream: int = llegados[bi]
+                        let r_resp: String = llegados[bi + 1]
+                        let r_sse: int = llegados[bi + 2]
+                        let f_idx: int = h2f_index_of(fl_streams, r_stream)
+                        if f_idx >= 0 {
+                            let f_tid: int = fl_tids[f_idx]
+                            thread_join(f_tid)
+                            fl_streams = h2f_without(fl_streams, f_idx)
+                            fl_tids = h2f_without(fl_tids, f_idx)
+                        }
+                        let pr2: Array = h2f_parse_response(r_resp)
+                        let st2: int = pr2[0]
+                        let h2h: Array = pr2[1]
+                        let b2: String = pr2[2]
+                        if r_sse >= 0 {
+                            if h2_respond_start(sess, r_stream, st2, h2h) == 0 {
+                                // El primer evento puede haber viajado en el
+                                // mismo segmento que la cabecera: ya está en el
+                                // buffer del runtime y el poll no lo ve. Se
+                                // drena acá, sin esperar.
+                                if h2f_sse_pump(sess, r_stream, r_sse) {
+                                    h2f_sse_close(r_sse)
+                                } else {
+                                    sse_streams.push(r_stream)
+                                    sse_fds.push(r_sse)
+                                }
+                            } else {
+                                // El cliente ya había cancelado el flujo.
+                                h2f_sse_close(r_sse)
+                            }
+                        } else {
+                            h2_respond(sess, r_stream, st2, h2h, b2)
+                        }
+                        bi = bi + 3
+                    }
+                } else if idx < fds.length() {
+                    let p_fd: int = fds[idx]
+                    let p_stream: int = fds_stream[idx]
+                    // El flujo pudo cerrarse en esta misma vuelta (cancelación
+                    // del cliente, paso 4): su fd ya no es nuestro.
+                    let q_idx: int = h2f_index_of(sse_streams, p_stream)
+                    if q_idx >= 0 and h2f_sse_pump(sess, p_stream, p_fd) {
+                        if q_idx >= 0 {
+                            h2f_sse_close(p_fd)
+                            sse_streams = h2f_without(sse_streams, q_idx)
+                            sse_fds = h2f_without(sse_fds, q_idx)
+                        }
+                    }
+                }
+                li = li + 1
+            }
+        }
+    }
+
+    // Cierre: los SSE se cortan ya; a las peticiones en vuelo se las espera
+    // (su plazo es el del upstream) para no dejar hilos huérfanos escribiendo
+    // en un buzón que ya nadie lee, y lo que traigan se descarta.
+    var ci: int = 0
+    while ci < sse_fds.length() {
+        let x_fd: int = sse_fds[ci]
+        h2f_sse_close(x_fd)
+        ci = ci + 1
+    }
+    var ti: int = 0
+    while ti < fl_tids.length() {
+        let x_tid: int = fl_tids[ti]
+        thread_join(x_tid)
+        ti = ti + 1
+    }
+    mutex_lock(mtx)
+    var zi: int = 0
+    while zi + 2 < buzon.length() {
+        let z_sse: int = buzon[zi + 2]
+        if z_sse >= 0 {
+            h2f_sse_close(z_sse)
+        }
+        zi = zi + 3
+    }
+    mutex_unlock(mtx)
+    mutex_destroy(mtx)
+    close_fd(wake_r)
+    close_fd(wake_w)
+    h2f_conns_add(0 - 1)
+    return 0
+}

@@ -252,6 +252,13 @@ fn sse_release() {
     return 0
 }
 
+// Libera el cupo de un túnel SSE diferido (proxy_dispatch_o), después de cerrar
+// su fd. Va en par con la reserva que hizo el dispatch.
+pub fn sse_slot_release() {
+    sse_release()
+    return 0
+}
+
 // Inyecta X-Forwarded-For / X-Real-IP en un array de headers parseados
 // [k1, v1, k2, v2, ...]. El gateway (que tiene la IP vía getpeername) llama
 // esto ANTES de proxy_dispatch/ws_proxy; forward_pooled y el handshake WS
@@ -1368,6 +1375,19 @@ pub fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, h
 // Devuelve "" cuando ya no queda nada que escribirle al cliente (túnel hecho, o
 // cliente ido): los dos workers del gateway ya chequean eso antes de escribir.
 pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
+    let sin_diferir: Array = []
+    return proxy_dispatch_o(raw, ssl_handle, client_fd, sin_diferir)
+}
+
+// Como proxy_dispatch_c, con una salida más para quien tuneliza por su cuenta
+// (el frente HTTP/2, src/h2front.nx, que no tiene un socket de cliente al que
+// escribirle crudo). `diferido` vacío = la conducta de siempre. Con
+// `diferido = [-1, es_https]`, un canal SSE NO se tuneliza acá: se reserva su
+// cupo, `diferido[0]` recibe el fd del upstream y se devuelve la cabecera de la
+// respuesta. Quien llama pasa a ser el dueño del fd: lo cierra y después llama
+// sse_slot_release(). Si `diferido[0]` sigue en -1, lo devuelto es una
+// respuesta completa, como siempre.
+pub fn proxy_dispatch_o(raw: Array, ssl_handle: int, client_fd: int, diferido: Array) -> String {
     let method: String = raw[1]
     let path: String = raw[2]
     let headers: Array = raw[3]
@@ -1494,7 +1514,7 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     let cfg: ProxyConfig = g_upstream_configs[best_idx]
     let backend: Backend = select_backend(cfg)
     var tunnel_ok: int = 0
-    if ssl_handle > 0 or client_fd >= 0 {
+    if ssl_handle > 0 or client_fd >= 0 or diferido.length() > 0 {
         tunnel_ok = 1
     }
     let t0: int = monotonic_us()
@@ -1502,6 +1522,12 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
     var scheme: String = "http"
     if ssl_handle > 0 {
         scheme = "https"
+    }
+    if diferido.length() > 1 {
+        let dif_https: int = diferido[1]
+        if dif_https == 1 {
+            scheme = "https"
+        }
     }
     let fr: Array = forward_pooled_x(best_idx, method, forward_path, headers, body, backend, tunnel_ok, scheme)
     let resp: String = fr[0]
@@ -1534,6 +1560,16 @@ pub fn proxy_dispatch_c(raw: Array, ssl_handle: int, client_fd: int) -> String {
         }
         access_log(method, path, 200, t1 - t0)
         metrics_record_request(host_name, 200, t1 - t_start, 0)
+        if diferido.length() > 0 {
+            // El túnel lo corre quien llamó. La reserva del cupo se hace acá
+            // para que el tope de túneles valga igual por los dos caminos.
+            if sse_reserve() == 0 {
+                pool_discard(sse_fd)
+                return http_response(503, "Service Unavailable: too many SSE tunnels")
+            }
+            diferido[0] = sse_fd
+            return resp
+        }
         if sse_tunnel(ssl_handle, client_fd, sse_fd, resp) == 1 {
             // Perdió la carrera por el cupo contra otro worker.
             return http_response(503, "Service Unavailable: too many SSE tunnels")

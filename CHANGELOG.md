@@ -3,6 +3,34 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.13 — 2026-11-13
+
+**HTTP/2 hacia el cliente (ALPN `h2`), con los canales SSE como flujos.**
+
+Con HTTP/1.1 un navegador abre como mucho 6 conexiones por dominio, compartidas entre todas sus
+pestañas, y cada canal SSE ocupa una para siempre: con seis pantallas abiertas la petición
+siguiente espera en la cola del navegador aunque el upstream responda en milisegundos (medido por
+nyxerp: de 20 s a más de un minuto). Con `http2 = true` todo viaja por una conexión con hasta 100
+flujos. Hacia los upstreams se sigue hablando HTTP/1.1.
+
+- `src/h2front.nx` (nuevo): un bucle por conexión, único escritor al cliente. Cada petición común
+  se despacha por el router de siempre en un hilo auxiliar (una lenta no frena a las demás); un
+  canal SSE no gasta hilo, lo bombea el bucle y cada trozo sale como frame `DATA` sin almacenarse.
+  API: `proxy_h2_init()`, `proxy_h2_negotiated(ssl)`, `proxy_h2_spawn_conn(ssl, ip)`,
+  `proxy_h2_serve_conn(ssl, ip)`, `proxy_h2_open_conns()`.
+- `src/router.nx`: `proxy_dispatch_o` (despacho con túnel SSE diferido) y `sse_slot_release`.
+  `proxy_dispatch_c` y `proxy_dispatch` no cambian de firma ni de conducta.
+- `src/config.nx`: `[server] http2` (apagado por defecto), `http2_max_body`,
+  `http2_idle_timeout`, `http2_max_inflight`.
+- El protocolo (HPACK, control de flujo, topes contra rapid reset y demás abusos) es de
+  `std/http2`: **requiere un toolchain Nyx del 2026-11-13 o posterior**.
+- `examples/gateway-tls/main.nx` muestra el enganche: tres líneas en el trabajador TLS.
+- Tests: `tests/e2e_h2/run.sh`, de punta a punta contra `curl` con nghttp2 (15 chequeos; entre
+  ellos 8 SSE y un `GET` por una sola conexión, y que no queden túneles colgados). Corre dentro de
+  `make test-proxy`.
+- No hay WebSocket sobre HTTP/2: el navegador abre el WebSocket por una conexión HTTP/1.1 aparte,
+  como siempre.
+
 ## v0.4.12 — 2026-10-26
 
 **Un header del upstream con un número enorme o inválido ya no tumba el proxy.**

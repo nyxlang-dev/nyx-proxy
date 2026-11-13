@@ -12,8 +12,11 @@ build:
 	nyx build
 
 # Unit tests .nx sin servidores: cache LRU, histogramas Prometheus, XFF.
+# Después, la prueba de punta a punta del frente HTTP/2 contra curl (SKIP limpio
+# si curl no trae HTTP/2).
 test-proxy:
 	bash scripts/run_unit_tests.sh
+	bash tests/e2e_h2/run.sh
 
 clean:
 	rm -f nyx-proxy script.nx script.ll nyx.lock
