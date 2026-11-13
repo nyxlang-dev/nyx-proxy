@@ -3,6 +3,13 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.4.14 — 2026-11-13
+
+**Tope de conexiones HTTP/2 abiertas** (`server.http2_max_conns`, 1024 por defecto). Cada conexión
+HTTP/2 vive en un hilo propio y 0.4.13 no les ponía límite: abrir conexiones sin parar agotaba los
+hilos del proceso. Pasado el tope, `proxy_h2_spawn_conn` cierra la conexión y devuelve -1. Las
+conexiones sin flujos ya se cerraban a los `http2_idle_timeout` segundos.
+
 ## v0.4.13 — 2026-11-13
 
 **HTTP/2 hacia el cliente (ALPN `h2`), con los canales SSE como flujos.**

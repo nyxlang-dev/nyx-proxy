@@ -20,6 +20,7 @@ Configuration is read from `proxy.toml` in the working directory at startup.
 | `http2` | bool | `false` | Offer HTTP/2 to clients on the TLS port (ALPN `h2`), v0.4.13+. Upstreams are still reached over HTTP/1.1. A browser then uses ONE connection with up to 100 streams instead of 6 connections per domain — which matters as soon as pages keep SSE channels open. The gateway's `main` must call `proxy_h2_init()` after loading its certificates and hand `h2` connections to `proxy_h2_spawn_conn` (see `examples/gateway-tls/main.nx`). Clients without HTTP/2 keep working over HTTP/1.1. WebSocket still uses a separate HTTP/1.1 connection. Not hot-reloaded: restart to change it. |
 | `http2_max_body` | int | `16777216` | Largest request body accepted over HTTP/2, in bytes; beyond it the client gets `413`. |
 | `http2_idle_timeout` | int | `120` | Seconds an HTTP/2 connection with no open streams is kept before it is closed. A connection with an SSE channel open is never idle. |
+| `http2_max_conns` | int | `1024` | HTTP/2 connections open at once (v0.4.14+). Each one is a thread for its whole life (one per browser, not per tab); beyond the cap a new connection is closed right after the handshake. |
 | `http2_max_inflight` | int | `64` | Requests of ONE connection being forwarded at the same time (each uses a thread while the upstream answers). Beyond it the request gets `503` with `Retry-After: 1`. SSE channels do not count. |
 
 Setting `tls_cert`/`tls_key` enables TLS mode in the config globals. The

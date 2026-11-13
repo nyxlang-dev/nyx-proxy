@@ -41,7 +41,8 @@ import "src/ratelimit"
 // le traslada al upstream en vez de crecer en memoria.
 const H2F_SSE_BACKLOG: int = 262144
 
-// Conexiones HTTP/2 abiertas ahora (diagnóstico y tests).
+// Conexiones HTTP/2 abiertas ahora, las lanzadas con proxy_h2_spawn_conn (tope,
+// diagnóstico y tests).
 var g_h2_conns: Array = [0]
 var g_h2_mtx: Map = Map.new()
 var g_h2_mtx_init: int = 0
@@ -236,10 +237,29 @@ fn h2f_sse_pump(sess: int, stream: int, fd: int) -> bool {
 // trabajador que la aceptó queda libre para la siguiente. Una conexión HTTP/2
 // dura minutos u horas (es una por navegador), y dejarla en un trabajador del
 // pool lo sacaría de circulación. El hilo cierra el handle al terminar.
+//
+// Cada conexión HTTP/2 es un hilo, así que hay un tope (`server.http2_max_conns`):
+// pasado, la conexión se cierra sin atender y devuelve -1. Sin tope, abrir
+// conexiones sin parar agotaría los hilos del proceso.
 pub fn proxy_h2_spawn_conn(ssl_handle: int, client_ip: String) -> int {
+    var hay_cupo: bool = true
+    if g_h2_mtx_init == 1 {
+        mutex_lock(g_h2_mtx)
+        if g_h2_conns[0] >= g_http2_max_conns {
+            hay_cupo = false
+        } else {
+            g_h2_conns[0] = g_h2_conns[0] + 1
+        }
+        mutex_unlock(g_h2_mtx)
+    }
+    if not hay_cupo {
+        tls_close_conn(ssl_handle)
+        return -1
+    }
     fn conexion() -> int {
         proxy_h2_serve_conn(ssl_handle, client_ip)
         tls_close_conn(ssl_handle)
+        h2f_conns_add(0 - 1)
         return 0
     }
     let tid: int = thread_spawn(conexion)
@@ -268,7 +288,6 @@ pub fn proxy_h2_serve_conn(ssl_handle: int, client_ip: String) -> int {
     var sse_streams: Array = []
     var sse_fds: Array = []
 
-    h2f_conns_add(1)
     var vivo: bool = true
     var ocio_desde: int = time_epoch()
 
@@ -465,6 +484,5 @@ pub fn proxy_h2_serve_conn(ssl_handle: int, client_ip: String) -> int {
     mutex_destroy(mtx)
     close_fd(wake_r)
     close_fd(wake_w)
-    h2f_conns_add(0 - 1)
     return 0
 }

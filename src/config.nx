@@ -30,6 +30,7 @@ var g_http2_enabled: int = 0
 var g_http2_max_body: int = 16777216
 var g_http2_idle_s: int = 120
 var g_http2_max_inflight: int = 64
+var g_http2_max_conns: int = 1024
 
 // Cache config (leido por cache.cache_init desde los consumers).
 var g_cache_cfg_enabled: int = 0
@@ -167,6 +168,7 @@ pub fn load_config(path: String) {
     g_http2_max_body = toml_get_int(parsed, "server.http2_max_body", 16777216)
     g_http2_idle_s = toml_get_int(parsed, "server.http2_idle_timeout", 120)
     g_http2_max_inflight = toml_get_int(parsed, "server.http2_max_inflight", 64)
+    g_http2_max_conns = toml_get_int(parsed, "server.http2_max_conns", 1024)
     g_tls_cert = toml_get(parsed, "server.tls_cert", "")
     g_tls_key = toml_get(parsed, "server.tls_key", "")
     if g_tls_cert.length() > 0 {
