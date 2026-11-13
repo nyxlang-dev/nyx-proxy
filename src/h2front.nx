@@ -121,9 +121,37 @@ fn h2f_parse_response(resp: String) -> Array {
     return [status, headers, body]
 }
 
+// Nombre de cabecera en su forma canónica de HTTP/1.1: mayúscula inicial y
+// después de cada guion ("content-type" → "Content-Type").
+//
+// HTTP/2 obliga a mandar los nombres en minúsculas, pero el upstream es un
+// servidor HTTP/1.1 y hay servidores que los buscan con las mayúsculas con que
+// los manda un navegador: `std/serve` arma `req.cookies` solo si la cabecera se
+// llama "Cookie", y lee "Content-Type" igual. Sin esto, la misma petición que
+// por HTTP/1.1 funcionaba llegaba por HTTP/2 sin sesión y sin formulario, en
+// silencio (medido antes del primer deploy, 2026-11-13). Con esto el upstream
+// no puede distinguir por dónde entró el cliente.
+fn h2f_canon(name: String) -> String {
+    let n: int = str_byte_length(name)
+    var out: String = ""
+    var inicio: bool = true
+    var i: int = 0
+    while i < n {
+        let ch: String = name.substring(i, i + 1)
+        if inicio {
+            out = out + ch.toUpper()
+        } else {
+            out = out + ch
+        }
+        inicio = ch == "-"
+        i = i + 1
+    }
+    return out
+}
+
 // Las cabeceras de la petición HTTP/2 en la forma que espera el router: Host
-// desde :authority, y las `cookie` sueltas (HTTP/2 las puede partir, RFC 9113
-// §8.2.3) unidas en una sola.
+// desde :authority, las `cookie` sueltas (HTTP/2 las puede partir, RFC 9113
+// §8.2.3) unidas en una sola, y los nombres en su forma canónica.
 fn h2f_request_headers(req: H2Request, client_ip: String) -> Array {
     var headers: Array = []
     var host: String = req.authority
@@ -138,14 +166,14 @@ fn h2f_request_headers(req: H2Request, client_ip: String) -> Array {
             if str_byte_length(cookie) > 0 { cookie = cookie + "; " }
             cookie = cookie + v
         } else {
-            headers.push(k)
+            headers.push(h2f_canon(k))
             headers.push(v)
         }
         i = i + 2
     }
     var out: Array = ["Host", host]
     if str_byte_length(cookie) > 0 {
-        out.push("cookie")
+        out.push("Cookie")
         out.push(cookie)
     }
     var j: int = 0

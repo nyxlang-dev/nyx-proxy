@@ -42,7 +42,10 @@ fn worker() -> int {
                         }
                     }
                 }
-                let request: Array = ["request", method, path, inject_forwarded_headers(headers, client_ip), ""]
+                var body: String = ""
+                let cl: int = string_to_int_or(http_find_header(headers, "Content-Length"), 0)
+                if cl > 0 { body = tls_read(ssl, cl) }
+                let request: Array = ["request", method, path, inject_forwarded_headers(headers, client_ip), body]
                 let resp: String = proxy_dispatch_c(request, ssl, -1)
                 if resp.length() > 0 { tls_write_conn(ssl, resp) }
             }

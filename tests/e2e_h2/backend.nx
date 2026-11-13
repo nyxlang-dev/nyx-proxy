@@ -3,6 +3,7 @@
 // Uso: ./backend <puerto>
 import "std/web"
 import "std/serve"
+import "std/http"
 
 fn avisos(req: Request) -> Response { return sse_open(req, "sala") }
 fn hola(_req: Request) -> Response { return response_new(200, "hola") }
@@ -33,6 +34,23 @@ fn cabeceras(req: Request) -> Response {
     return response_new(200, txt)
 }
 
+// Lo que std/serve entiende de la petición: el formulario, las cookies y el
+// nombre exacto con que llegó la cabecera de tipo de contenido.
+fn entendido(req: Request) -> Response {
+    var fa: String = "?"
+    if req.form.contains("a") {
+        let v: String = req.form.get("a")
+        fa = v
+    }
+    var cs: String = "?"
+    if req.cookies.contains("s") {
+        let c: String = req.cookies.get("s")
+        cs = c
+    }
+    let txt: String = "form.a=" + fa + " cookie.s=" + cs + " ctype=" + http_find_header(req.headers_flat, "Content-Type")
+    return response_new(200, txt)
+}
+
 fn cuenta(_req: Request) -> Response { return response_new(200, int_to_string(sse_count())) }
 
 fn latido() -> int {
@@ -60,6 +78,7 @@ fn main() -> int {
     app_get(app, "/cabeceras", cabeceras)
     app_get(app, "/cuenta", cuenta)
     app_post(app, "/eco", eco)
+    app_post(app, "/entendido", entendido)
     thread_spawn(latido)
     return serve_app_en(app, "127.0.0.1", port, 16)
 }

@@ -57,6 +57,12 @@ check "un cliente HTTP/1.1 sigue funcionando" "$(curl -sk --max-time 5 --http1.1
 check "POST con cuerpo" "$(curl -sk --max-time 5 --http2 -d 'hola cuerpo' "$U/eco")" "hola cuerpo"
 check "cuerpo de 300 KB íntegro" "$(curl -sk --max-time 10 --http2 "$U/grande" | sha256sum | cut -c1-16)" "$(python3 -c "import hashlib;print(hashlib.sha256(('0123456789abcdef'*64*293).encode()).hexdigest()[:16])")"
 check "X-Forwarded-Proto, cookies unidas y X-Forwarded-For" "$(curl -sk --max-time 5 --http2 -H 'Cookie: a=1' -H 'Cookie: b=2' "$U/cabeceras")" "proto=https cookie=a=1; b=2 xff=127.0.0.1"
+# El upstream es un servidor HTTP/1.1 que busca "Cookie" y "Content-Type" con
+# esas mayúsculas exactas (std/serve). En HTTP/2 los nombres viajan en
+# minúsculas: el gateway los devuelve a su forma canónica al reescribir.
+ESPERADO="form.a=1 cookie.s=abc ctype=application/x-www-form-urlencoded"
+check "formulario y cookie de sesión por HTTP/2" "$(curl -sk --max-time 5 --http2 -H 'Cookie: s=abc' -d 'a=1' "$U/entendido")" "$ESPERADO"
+check "lo mismo por HTTP/1.1 (referencia)" "$(curl -sk --max-time 5 --http1.1 -H 'Cookie: s=abc' -d 'a=1' "$U/entendido")" "$ESPERADO"
 check "404 del upstream" "$(curl -sk --max-time 5 --http2 -o /dev/null -w '%{http_code}' "$U/nada")" "404"
 
 # Un SSE solo: llegan eventos mientras el canal sigue abierto.

@@ -10,6 +10,11 @@ HTTP/2 vive en un hilo propio y 0.4.13 no les ponía límite: abrir conexiones s
 hilos del proceso. Pasado el tope, `proxy_h2_spawn_conn` cierra la conexión y devuelve -1. Las
 conexiones sin flujos ya se cerraban a los `http2_idle_timeout` segundos.
 
+**Los nombres de cabecera llegan al upstream en su forma canónica** (`Cookie`, `Content-Type`).
+HTTP/2 los manda en minúsculas y 0.4.13 los reenviaba así; `std/serve` arma `req.cookies` y lee el
+tipo de contenido buscando las mayúsculas exactas, así que una petición por HTTP/2 llegaba sin
+sesión y sin formulario, en silencio. Dos chequeos nuevos en `tests/e2e_h2/run.sh`.
+
 ## v0.4.13 — 2026-11-13
 
 **HTTP/2 hacia el cliente (ALPN `h2`), con los canales SSE como flujos.**
