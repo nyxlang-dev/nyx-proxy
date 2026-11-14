@@ -119,7 +119,7 @@ if [ -z "$retro$abandon" ]; then
         || die "CHANGELOG.md sin la etiqueta «[arco: $slug]» en ningún bloque de versión"
     # PORTE: acá NO se valida docs/SESSION_LOG.md (no existe: en este repo el CHANGELOG ES la
     # bitácora, es narrativo y explica el porqué de cada cambio) ni PROJECT_STATE.md (vive
-    # fuera del repo, en ~/nyx/ops/proxy/, y grepear fuera del árbol rompería el fixture).
+    # fuera del repo, en ~/servidor/archivo/ops/proxy/, y grepear fuera del árbol rompería el fixture).
     # Lo que sí se conserva es la disciplina de sacar el arco de la doc de arcos vivos:
     grep -qF "$base.md" docs/design/ROADMAP.md 2>/dev/null \
         && die "el arco sigue citado en docs/design/ROADMAP.md: se saca de los arcos vivos antes de cerrar"

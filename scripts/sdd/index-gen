@@ -28,7 +28,7 @@ trap 'rm -f "$tbl" "$new"' EXIT
 
 # «Referenciado por» = quién cita este artefacto desde la doc raíz. La lista es la de ESTE
 # repo, no la del lenguaje: acá no hay PLAN.md ni PROJECT_STATE.md (el estado del proxy vive
-# fuera del repo, en ~/nyx/ops/proxy/). docs/design/ROADMAP.md entra a propósito aunque esté
+# fuera del repo, en ~/servidor/archivo/ops/proxy/). docs/design/ROADMAP.md entra a propósito aunque esté
 # dentro de design/: es la doc raíz de arcos vivos, el equivalente local de PLAN.md, y sin
 # ella un VIGENTE de referencia no tendría de dónde colgarse (regla (b) de state-check).
 refs_of() {

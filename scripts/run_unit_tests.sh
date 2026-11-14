@@ -19,7 +19,7 @@
 # (bind rechazado), no en silencio.
 set -uo pipefail
 STACK="$(cd "$(dirname "$0")/.." && pwd)"
-NYX_HOME="${NYX_HOME:-/home/admin/nyx/lang}"
+NYX_HOME="${NYX_HOME:-/home/admin/nyxlang}"
 export NYX_HOME
 cd "$STACK"
 TESTS="test_proxy_cache test_proxy_metrics test_proxy_xff test_proxy_retry test_proxy_config_listen test_proxy_time test_proxy_pool_framing test_proxy_sse_tunnel test_proxy_sse_tls test_proxy_fwd_headers test_proxy_pool_idle test_proxy_vhost_wildcard"

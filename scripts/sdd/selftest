@@ -172,7 +172,7 @@ mut j "ruta absoluta de máquina" "ruta Windows en un encargo" \
 # docs/archive/sdd/ y lo COMMITEA. En el repo del lenguaje (j) miraba solo los briefs, así que
 # una cosecha con rutas de máquina se publicaba sin que nada chistara.
 mut j "ruta absoluta de máquina" "home de usuario en la COSECHA publicada" \
-    "mkdir -p docs/archive/sdd/2026-09-20-demo && printf '# SDD ledger\n\nel binario quedó en /home/admin/nyx/products/proxy/nyx-proxy\n' > docs/archive/sdd/2026-09-20-demo/progress.md"
+    "mkdir -p docs/archive/sdd/2026-09-20-demo && printf '# SDD ledger\n\nel binario quedó en /home/admin/products/proxy/nyx-proxy\n' > docs/archive/sdd/2026-09-20-demo/progress.md"
 mut j "ruta absoluta de máquina" "montaje WSL en un plan" \
     "printf '\nel checkout está en /mnt/c/repos/proxy\n' >> $PLAN"
 
@@ -181,7 +181,7 @@ mut j "ruta absoluta de máquina" "montaje WSL en un plan" \
 # rojo, o la guarda sería inservible: obligaría a escribir encargos sin comandos.
 rm -rf "$MUT"; cp -a "$SNAP" "$MUT"
 mkdir -p "$MUT/docs/design/briefs/2026-09-20-demo"
-printf '# Brief\n\ncd ~/nyx/products/proxy && make test-proxy 2>&1 | tee /tmp/test.log\nver scripts/run_unit_tests.sh\n' \
+printf '# Brief\n\ncd ~/products/proxy && make test-proxy 2>&1 | tee /tmp/test.log\nver scripts/run_unit_tests.sh\n' \
     > "$MUT/docs/design/briefs/2026-09-20-demo/task-1.md"
 out=$(bash "$SDD/state-check" "$MUT" 2>&1); rc=$?
 chk "(j) no molesta a un doc con rutas relativas, ~/nyx/… y /tmp/<archivo>" "$rc:$(printf '%s' "$out" | tail -1)" "0:✓ state-check"

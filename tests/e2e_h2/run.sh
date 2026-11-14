@@ -10,7 +10,7 @@
 # SKIP limpio si curl no trae HTTP/2 u openssl no está.
 set -u
 STACK="$(cd "$(dirname "$0")/../.." && pwd)"
-NYX_HOME="${NYX_HOME:-/home/admin/nyx/lang}"
+NYX_HOME="${NYX_HOME:-/home/admin/nyxlang}"
 export NYX_HOME
 if ! curl --version 2>/dev/null | grep -q "HTTP2"; then echo "SKIP e2e_h2: curl sin HTTP/2"; exit 0; fi
 if ! command -v openssl >/dev/null 2>&1; then echo "SKIP e2e_h2: sin openssl"; exit 0; fi

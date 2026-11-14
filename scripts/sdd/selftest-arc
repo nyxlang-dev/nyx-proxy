@@ -161,7 +161,7 @@ amut 'exige gate de merge' 'Global Constraints pide gate y el ledger no lo tiene
 # LA MUTACIÓN QUE JUSTIFICA §10: el repo es PÚBLICO y la cosecha se commitea. Un ledger con una
 # ruta de máquina tiene que frenar el cierre ANTES de escribir, no quedar en la historia de git.
 amut 'cita una ruta de máquina' 'el ledger publicaría un home de usuario' \
-    "printf 'el binario quedó en /home/admin/nyx/products/proxy/nyx-proxy\n' >> .sdd/$BASE/progress.md"
+    "printf 'el binario quedó en /home/admin/products/proxy/nyx-proxy\n' >> .sdd/$BASE/progress.md"
 amut 'cita una ruta de máquina' 'un report publicaría un scratchpad de sesión' \
     "printf 'notas en /tmp/claude-1000/x/y/scratchpad/n.md\n' >> .sdd/$BASE/task-1-report.md"
 

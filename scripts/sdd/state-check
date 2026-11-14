@@ -33,7 +33,7 @@ done
 # --- (b) VIGENTE: citado por doc viva —raíz, o un nivel vía plan/spec VIGENTE que la raíz cita—
 #     o con ledger; GO Ottavio si la fecha es posterior a la adopción ---
 # La lista de docs raíz es la de ESTE repo. No hay PLAN.md ni PROJECT_STATE.md: el estado del
-# proxy vive fuera del repo (~/nyx/ops/proxy/) y no se puede grepear desde acá sin romper la
+# proxy vive fuera del repo (~/servidor/archivo/ops/proxy/) y no se puede grepear desde acá sin romper la
 # hermeticidad del fixture. docs/design/ROADMAP.md hace de PLAN.md local: es la única doc de
 # design/ que cuenta como raíz, y existe justamente para que un spec de referencia tenga de
 # dónde colgarse sin necesidad de un ledger vivo.

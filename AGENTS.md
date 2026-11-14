@@ -30,7 +30,7 @@ multi-dominio, health checks activos, rate limiting per-IP, cache LRU por host c
 `/metrics` Prometheus, WebSocket proxying y access logging.
 
 El binario que produce `make build` (desde `examples/standalone.nx`) es un **smoke HTTP-only**, no
-el producto. El consumer de producción vive aparte, en `~/nyx/web/gateway`: es el gateway HTTPS
+el producto. El consumer de producción vive aparte, en `~/web/gateway`: es el gateway HTTPS
 :443 de nyxlang.com y **vendoriza esta lib commiteada** en su `packages/nyx-proxy/`, con pin
 explícito, vía su `scripts/vendor_nyx_proxy.sh`. Cambiar la lib no cambia producción: hay que
 re-vendorizar, commitear el pin, recompilar y reiniciar el servicio.
