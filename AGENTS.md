@@ -182,5 +182,5 @@ escribe un archivo commiteable — nunca por chat.
 
 Como el repo es público, **lo que el cierre cosecha se publica**. Por eso `arc-close` rechaza
 cerrar si el ledger cita una ruta de máquina (`/home/…`, un scratchpad de sesión, un montaje de
-WSL). Escribí `~/nyx/…` y listo. El método completo, con las diez reglas y sus guardas, está en
+WSL). Escribí `~/nyxlang/…` y listo. El método completo, con las diez reglas y sus guardas, está en
 `docs/design/specs/2026-09-20-sdd-proxy-design.md`.
