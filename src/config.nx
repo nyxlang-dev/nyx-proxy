@@ -3,6 +3,7 @@
 
 import "std/toml"
 import "std/proxy"
+import "src/cache"
 
 // Global routing state — accessed by router.nx, health.nx, logger.nx, main.nx
 var g_listen_port: int = 8080
@@ -17,6 +18,9 @@ var g_upstream_idle_s: int = 10
 var g_upstream_names: Array = []
 var g_upstream_prefixes: Array = []
 var g_upstream_configs: Array = []
+// Paralelo a g_upstream_configs: 1 si el upstream declaró `cache = true`. La
+// caché es opt-in POR UPSTREAM: `[cache] enabled = 1` solo no guarda nada.
+var g_upstream_cache: Array = []
 var g_upstream_count: int = 0
 var g_default_upstream: int = -1
 var g_tls_cert: String = ""
@@ -77,6 +81,7 @@ fn reset_routing_globals() {
     g_upstream_names = []
     g_upstream_prefixes = []
     g_upstream_configs = []
+    g_upstream_cache = []
     g_upstream_count = 0
     g_default_upstream = -1
     g_vhost_names = []
@@ -124,6 +129,13 @@ pub fn load_config(path: String) {
         g_upstream_names.push(name)
         g_upstream_prefixes.push(path_prefix)
         g_upstream_configs.push(cfg)
+        // `cache = true` (o `1`, como se escribe `[cache] enabled`).
+        let cache_raw: String = toml_get(parsed, pfx + ".cache", "")
+        if cache_raw == "true" or cache_raw == "1" {
+            g_upstream_cache.push(1)
+        } else {
+            g_upstream_cache.push(0)
+        }
 
         if path_prefix == "" and hostname == "" {
             g_default_upstream = g_upstream_count
@@ -186,6 +198,18 @@ pub fn load_config(path: String) {
     g_cache_cfg_enabled = toml_get_int(parsed, "cache.enabled", 0)
     g_cache_cfg_max_entries = toml_get_int(parsed, "cache.max_entries", 10000)
     g_cache_cfg_default_ttl_s = toml_get_int(parsed, "cache.default_ttl_seconds", 300)
+    if g_cache_cfg_enabled == 1 {
+        var con_cache: int = 0
+        var ci: int = 0
+        while ci < g_upstream_cache.length() {
+            let cflag: int = g_upstream_cache[ci]
+            con_cache = con_cache + cflag
+            ci = ci + 1
+        }
+        if con_cache == 0 {
+            println("nyx-proxy: [cache] enabled = 1 pero ningún upstream declara `cache = true`: no se guarda nada")
+        }
+    }
 
     // Metrics (v0.3+): opt-in via [metrics.enabled] = true.
     g_metrics_enabled = toml_get_int(parsed, "metrics.enabled", 0)
@@ -205,6 +229,15 @@ pub fn reload_config_if_changed() -> int {
     if now_mt == 0 { return 0 }
     if now_mt == g_config_mtime { return 0 }
     load_config(g_config_path)
+    // La caché entra en la recarga: apagarla (`[cache] enabled = 0`) la vacía y
+    // el router deja de consultarla en el pedido siguiente; encenderla la
+    // inicializa si el proceso arrancó con ella apagada. `max_entries` y
+    // `default_ttl_seconds` solo se leen la primera vez que se inicializa.
+    if g_cache_cfg_enabled == 1 {
+        cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)
+    } else {
+        cache_clear()
+    }
     return 1
 }
 

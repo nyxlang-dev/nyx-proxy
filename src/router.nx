@@ -1365,6 +1365,36 @@ pub fn ws_proxy(ssl_handle: int, method: String, path: String, headers: Array, h
     return 0
 }
 
+// 1 si los pedidos a este upstream pasan por la caché. Tres llaves, y hacen
+// falta las tres: la caché inicializada (cache_init), `[cache] enabled = 1` en
+// el proxy.toml VIGENTE —se relee en la recarga en caliente, así que apagarla
+// no exige reiniciar— y `cache = true` en la sección del upstream.
+fn cache_on_for(idx: int) -> int {
+    if g_cache_enabled == 0 { return 0 }
+    if g_cache_cfg_enabled == 0 { return 0 }
+    // Una recarga puede estar rearmando el array en este instante.
+    let flags: Array = g_upstream_cache
+    if idx < 0 or idx >= flags.length() { return 0 }
+    let f: int = flags[idx]
+    return f
+}
+
+// Contesta un acierto de caché: 304 sin cuerpo si el pedido es condicional y
+// lo guardado le sirve al cliente (If-None-Match / If-Modified-Since), o la
+// respuesta entera. El access log y las métricas registran el status REAL.
+fn cache_serve_hit(cached: String, headers: Array, method: String, path: String, host_name: String, t_start: int) -> String {
+    var status: int = 304
+    var out: String = cache_not_modified(cached, headers)
+    if out.length() == 0 {
+        status = 200
+        out = cache_mark_hit(cached)
+    }
+    let t_hit: int = monotonic_us()
+    access_log(method, path, status, t_hit - t_start)
+    metrics_record_request(host_name, status, t_hit - t_start, 1)
+    return out
+}
+
 // Variante con el socket del cliente a la vista, que es lo que permite tunelizar
 // en vez de acumular. Convención del sink: ssl_handle > 0 ⇒ TLS; ssl_handle == 0
 // y client_fd >= 0 ⇒ plano; ninguno de los dos ⇒ sin sink, y entonces el camino
@@ -1429,76 +1459,46 @@ pub fn proxy_dispatch_o(raw: Array, ssl_handle: int, client_fd: int, diferido: A
         host_name = host_header.substring(0, colon_pos)
     }
 
-    // Cache lookup antes de tocar backend. Solo GET — el contrato de
-    // HTTP dice que otros metodos tienen side effects que no cachear.
-    var sf_claimed: int = 0
-    if g_cache_enabled == 1 {
-        if method == "GET" {
-            let cached: String = cache_lookup(host_name, path)
-            if cached.length() > 0 {
-                let resp_hit: String = cache_mark_hit(cached)
-                let t_hit: int = monotonic_us()
-                access_log(method, path, 200, t_hit - t_start)
-                metrics_record_request(host_name, 200, t_hit - t_start, 1)
-                return resp_hit
-            }
-            // Miss — intentar claim singleflight. Si otro thread ya fetcha,
-            // esperar hasta 3s a que cachee y reusar.
-            sf_claimed = singleflight_claim(host_name, path)
-            if sf_claimed == 0 {
-                let sf_hit: String = singleflight_wait(host_name, path, 3000)
-                if sf_hit.length() > 0 {
-                    let resp_sf: String = cache_mark_hit(sf_hit)
-                    let t_sf: int = monotonic_us()
-                    access_log(method, path, 200, t_sf - t_start)
-                    metrics_record_request(host_name, 200, t_sf - t_start, 1)
-                    return resp_sf
-                }
-                // Timeout o fetcher descarto — fall through al backend por
-                // nuestra cuenta (degradacion benigna; re-claim explicito).
-                sf_claimed = singleflight_claim(host_name, path)
-            }
-        }
-    }
-
-    var best_idx: int = -1
-    var best_len: int = 0
-
-    // Virtual host routing: longest path_prefix wins under matching hostname,
-    // falling back to the bare-hostname (catch-all) upstream when no
-    // path_prefix matches. Without this two-pass, a vhost without
-    // path_prefix would shadow any vhost+path_prefix declared after it for
-    // the same hostname, even when the prefix matched the request path.
-    // Exact hostnames first, then one-label wildcards (`*.dominio`): see vhost_pick.
-    let vh: Array = vhost_pick(host_name, path)
-    best_idx = vh[0]
-    best_len = vh[1]
-
-    // If no vhost match, try longest prefix match across non-vhost upstreams
-    if best_idx < 0 {
-        var i: int = 0
-        while i < g_upstream_count {
-            let prefix: String = g_upstream_prefixes[i]
-            let plen: int = prefix.length()
-            if plen > 0 {
-                if path.startsWith(prefix) {
-                    if plen > best_len {
-                        best_idx = i
-                        best_len = plen
-                    }
-                }
-            }
-            i = i + 1
-        }
-    }
-
-    // No prefix match -> use default upstream
-    if best_idx < 0 {
-        best_idx = g_default_upstream
-    }
-
+    // El upstream se resuelve ANTES de mirar la caché: si se usa o no depende
+    // de él (`cache = true` en su sección). Exact hostnames first, then
+    // one-label wildcards, then path prefixes, then the default upstream.
+    let ru: Array = resolve_upstream_idx(host_name, path)
+    let best_idx: int = ru[0]
+    let best_len: int = ru[1]
     if best_idx < 0 {
         return http_response(503, "no upstream configured")
+    }
+
+    // ¿Este pedido pasa por la caché? Solo GET —otros métodos tienen efectos—,
+    // solo si el upstream la pidió, y NUNCA con Cookie o Authorization: ni se
+    // sirve de lo guardado ni se guarda su respuesta (cache_request_bypass).
+    var use_cache: int = 0
+    var ae_key: String = ""
+    if method == "GET" and cache_on_for(best_idx) == 1 {
+        if cache_request_bypass(headers) == 0 {
+            use_cache = 1
+            ae_key = cache_accept_encoding_key(header_ci(headers, "accept-encoding"))
+        }
+    }
+
+    var sf_claimed: int = 0
+    if use_cache == 1 {
+        let cached: String = cache_lookup_v(host_name, path, ae_key)
+        if cached.length() > 0 {
+            return cache_serve_hit(cached, headers, method, path, host_name, t_start)
+        }
+        // Miss — intentar claim singleflight. Si otro thread ya fetcha,
+        // esperar hasta 3s a que cachee y reusar.
+        sf_claimed = singleflight_claim_v(host_name, path, ae_key)
+        if sf_claimed == 0 {
+            let sf_hit: String = singleflight_wait_v(host_name, path, ae_key, 3000)
+            if sf_hit.length() > 0 {
+                return cache_serve_hit(sf_hit, headers, method, path, host_name, t_start)
+            }
+            // Timeout o fetcher descarto — fall through al backend por
+            // nuestra cuenta (degradacion benigna; re-claim explicito).
+            sf_claimed = singleflight_claim_v(host_name, path, ae_key)
+        }
     }
 
     // Strip matched prefix from path for the backend
@@ -1540,7 +1540,7 @@ pub fn proxy_dispatch_o(raw: Array, ssl_handle: int, client_fd: int, diferido: A
         // puede durar horas, y con el claim tomado TODO otro GET al mismo path
         // se comería el plazo de espera y después re-claimearía.
         if sf_claimed == 1 {
-            singleflight_release(host_name, path)
+            singleflight_release_v(host_name, path, ae_key)
         }
         // (2) NO se llama cache_try_store: `resp` es solo la cabecera, sin
         // cuerpo y sin longitud. Guardarla envenenaría el cache con una entrada
@@ -1586,16 +1586,14 @@ pub fn proxy_dispatch_o(raw: Array, ssl_handle: int, client_fd: int, diferido: A
     }
     access_log(method, path, log_status, t1 - t0)
 
-    // Intenta cachear si es GET (la lib decide si es cacheable por status +
-    // Cache-Control). Responses no cacheables retornan 0 sin efecto.
-    if g_cache_enabled == 1 {
-        if method == "GET" {
-            cache_try_store(host_name, path, resp)
-            // Si tenemos el claim, liberamos para despertar waiters.
-            if sf_claimed == 1 {
-                singleflight_release(host_name, path)
-            }
-        }
+    // Intenta guardar (la lib decide si la respuesta es guardable: status,
+    // Cache-Control, Set-Cookie, Vary). Las no guardables retornan 0 sin efecto.
+    if use_cache == 1 {
+        cache_try_store_v(host_name, path, ae_key, resp)
+    }
+    // Si tenemos el claim, liberamos para despertar waiters.
+    if sf_claimed == 1 {
+        singleflight_release_v(host_name, path, ae_key)
     }
 
     metrics_record_request(host_name, log_status, t1 - t_start, 0)

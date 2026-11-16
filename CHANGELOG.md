@@ -3,6 +3,55 @@
 Se lleva el historial de releases separado del lenguaje. Ver
 `/docs/PRODUCTS_ROADMAP.md` para el plan global de productos.
 
+## v0.5.0 — 2026-11-16
+
+**CAMBIO INCOMPATIBLE: la caché es opt-in por upstream.** Además de `[cache] enabled = 1`, cada
+`[upstream.N]` que quiera caché tiene que declarar `cache = true`. Un `proxy.toml` con solo
+`[cache] enabled = 1` ya no guarda nada (y lo avisa al cargar). Migración: agregá `cache = true`
+a los upstreams que quieras cachear. Por qué: la clave de la caché era `host:path` y valía para
+todos los pedidos, así que un upstream con sesiones que no lo esperaba quedaba cacheado entero.
+
+**Seguridad: un pedido con `Cookie` o `Authorization` ya no pasa por la caché.** Ni se sirve de lo
+guardado ni se guarda su respuesta; una respuesta con `Set-Cookie` tampoco se guarda. El
+2026-11-14 la respuesta de un usuario con sesión se sirvió, durante todo el TTL, a pedidos sin
+sesión. Desde la función nueva `cache_request_bypass`.
+
+**La caché entra en la recarga en caliente** (`reload_config_if_changed` / `watch_config_loop`;
+el consumer tiene que estar corriendo `watch_config_loop`). `[cache] enabled` y los `cache = true`
+se releen: apagarla vacía la caché sin reiniciar (`cache_clear`), encenderla la inicializa.
+`max_entries` y `default_ttl_seconds` se leen solo la primera vez que se inicializa.
+
+**`Vary` se respeta.** Sin `Vary`, una entrada por `host:path`; con `Vary: Accept-Encoding`, una
+por variante del `Accept-Encoding` normalizado del pedido (los códigos br/deflate/gzip/zstd/`*`
+que acepta, sin los `q=0`); cualquier otro `Vary` no se guarda. Una respuesta con
+`Content-Encoding` es una variante aunque no traiga `Vary`, y solo se guarda si el código es uno
+de esos cuatro y el pedido lo aceptaba. Antes un cliente sin `Accept-Encoding` podía recibir
+`content-encoding: gzip`.
+
+**Pedidos condicionales.** Un acierto contesta `304 Not Modified` sin cuerpo si el
+`If-None-Match` coincide con el `ETag` guardado (comparación débil, admite lista y `*`) o, sin
+`If-None-Match`, si el `If-Modified-Since` no es anterior al `Last-Modified` guardado. El 304
+repite `Cache-Control`, `Content-Location`, `Date`, `ETag`, `Expires`, `Last-Modified` y `Vary`, y
+lleva `X-Nyx-Cache: HIT`. El access log y `/metrics` registran el 304. Vale igual por HTTP/1.1 y
+HTTP/2. Antes: 200 con el cuerpo entero siempre.
+
+**`Cache-Control` se lee solo de la cabecera de la respuesta**, sin distinguir mayúsculas y por
+directiva entera. Antes se buscaba por subcadena en la respuesta completa, cuerpo incluido: un
+cuerpo que contuviera `max-age=` decidía el TTL. `s-maxage` manda sobre `max-age`.
+
+**API nueva en `src/cache.nx`:** `cache_lookup_v`, `cache_try_store_v`, `singleflight_claim_v` /
+`_wait_v` / `_release_v` (la clave de single-flight incluye la variante), `cache_request_bypass`,
+`cache_accept_encoding_key`, `cache_not_modified`, `cache_clear`. `cache_lookup`,
+`cache_try_store` y `singleflight_*` siguen con la misma firma.
+
+**Arreglo menor:** un GET sin upstream configurado ya no deja tomado el claim de single-flight (el
+503 sale antes de reclamar).
+
+Tests: `tests/test_proxy_cache.nx` (ampliado con las reglas nuevas), la suite nueva
+`tests/test_proxy_cache_router.nx` (el router contra upstreams reales) y chequeos nuevos de
+`tests/e2e_h2/run.sh` (la caché por HTTP/2 y por HTTP/1.1). Docs: `docs/CONFIG.md` describe qué se guarda, por
+cuánto y cómo se apaga.
+
 ## v0.4.14 — 2026-11-13
 
 **Tope de conexiones HTTP/2 abiertas** (`server.http2_max_conns`, 1024 por defecto). Cada conexión

@@ -1,14 +1,25 @@
 // cache.nx — Response cache LRU por-host con TTL.
 //
 // Almacena respuestas HTTP completas (status + headers + body ya
-// serializados como String) indexadas por "HOST:PATH". LRU via doubly-
-// linked list logico sobre arrays paralelos; todas las operaciones son
-// O(1) bajo un mutex global.
+// serializados como String). LRU via doubly-linked list logico sobre arrays
+// paralelos; todas las operaciones son O(1) bajo un mutex global.
 //
-// Cache-Control del upstream:
-//   - no-store / no-cache / private -> no cachea
-//   - max-age=N                     -> TTL = N segundos
-//   - ausente                       -> TTL = g_cache_default_ttl_s
+// QUÉ SE GUARDA (cache_try_store_v), todo leído SOLO de la cabecera de la
+// respuesta —nunca del cuerpo— y sin distinguir mayúsculas:
+//   - solo status 200
+//   - Cache-Control no-store / no-cache / private -> no se guarda
+//   - Set-Cookie                                   -> no se guarda
+//   - s-maxage=N, si no max-age=N, si no g_cache_default_ttl_s
+//   - Vary ausente              -> clave base  "b|HOST:PATH"
+//   - Vary: Accept-Encoding     -> clave por variante "v|<AE>|HOST:PATH", con
+//                                  el Accept-Encoding NORMALIZADO del pedido
+//   - cualquier otro Vary       -> no se guarda
+//   - Content-Encoding sin Vary -> se trata como Vary: Accept-Encoding
+//
+// QUÉ PEDIDOS PASAN POR LA CACHÉ lo decide el router (proxy_dispatch_o): solo
+// GET, solo upstreams con `cache = true`, y nunca un pedido con Cookie o
+// Authorization (cache_request_bypass). El 14/11/2026 la caché guardó la
+// respuesta de un usuario con sesión y se la sirvió a quien no la tenía.
 
 import "std/http"
 
@@ -47,7 +58,6 @@ pub fn cache_init(max_entries: int, default_ttl_s: int) {
     g_cache_mtx = mutex_new()
     g_cache_max_entries = max_entries
     g_cache_default_ttl_s = default_ttl_s
-    g_cache_enabled = 1
     var i: int = 0
     while i < max_entries {
         g_cache_keys.push("")
@@ -67,6 +77,9 @@ pub fn cache_init(max_entries: int, default_ttl_s: int) {
     g_cache_misses.push(0)
     g_cache_evicts.push(0)
     g_cache_init_done = 1
+    // AL FINAL: cache_init puede correr en el hilo de recarga de config con
+    // pedidos en vuelo, y el router mira este flag antes de tocar los arrays.
+    g_cache_enabled = 1
     return 0
 }
 
@@ -135,67 +148,263 @@ fn _evict_tail() {
     return 0
 }
 
-pub fn cache_lookup(host: String, path: String) -> String {
-    if g_cache_enabled == 0 { return "" }
-    let key: String = host + ":" + path
-    mutex_lock(g_cache_mtx)
-    if g_cache_map.contains(key) == false {
-        g_cache_misses[0] = g_cache_misses[0] + 1
-        mutex_unlock(g_cache_mtx)
-        return ""
-    }
+// Claves. La base es la de una respuesta que no varía; la de variante lleva el
+// Accept-Encoding normalizado ADELANTE, entre barras: `ae` solo puede contener
+// letras, comas y `*` (cache_accept_encoding_key), así que ningún host ni path
+// —que los elige el cliente— puede fabricar la clave de otra entrada.
+fn _key_base(host: String, path: String) -> String {
+    return "b|" + host + ":" + path
+}
+
+fn _key_variant(host: String, path: String, ae: String) -> String {
+    return "v|" + ae + "|" + host + ":" + path
+}
+
+// Con g_cache_mtx tomado. "" si la clave no está o venció (y entonces la libera).
+fn _lookup_locked(key: String) -> String {
+    if g_cache_map.contains(key) == false { return "" }
     let idx: int = g_cache_map.get(key)
-    let now_ms: int = time_ms()
-    if now_ms > g_cache_expires[idx] {
-        // Expirado — invalida inline y cuenta como miss.
+    if time_ms() > g_cache_expires[idx] {
         _lru_unlink(idx)
         _slot_free(idx)
-        g_cache_misses[0] = g_cache_misses[0] + 1
-        mutex_unlock(g_cache_mtx)
         return ""
     }
     let resp: String = g_cache_responses[idx]
     _lru_move_to_head(idx)
-    g_cache_hits[0] = g_cache_hits[0] + 1
+    return resp
+}
+
+// Busca primero la entrada base y después la variante de `ae` (el
+// Accept-Encoding del pedido ya normalizado con cache_accept_encoding_key).
+// Una entrada vencida cuenta como miss.
+pub fn cache_lookup_v(host: String, path: String, ae: String) -> String {
+    if g_cache_enabled == 0 { return "" }
+    mutex_lock(g_cache_mtx)
+    var resp: String = _lookup_locked(_key_base(host, path))
+    if resp.byte_length() == 0 {
+        resp = _lookup_locked(_key_variant(host, path, ae))
+    }
+    if resp.byte_length() == 0 {
+        g_cache_misses[0] = g_cache_misses[0] + 1
+    } else {
+        g_cache_hits[0] = g_cache_hits[0] + 1
+    }
     mutex_unlock(g_cache_mtx)
     return resp
 }
 
-// Busca needle a partir de un offset en haystack. indexOf builtin solo
-// toma un arg, asi que re-basamos con substring.
-// OJO: substring/indexOf operan sobre BYTES, pero length() cuenta
-// codepoints UTF-8 — para rebanar siempre byte_length(), o el slice
-// trunca el final cuando el string tiene caracteres multi-byte.
-fn _indexof_at(haystack: String, needle: String, start: int) -> int {
-    if start >= haystack.byte_length() { return -1 }
-    let tail: String = haystack.substring(start, haystack.byte_length())
-    let rel: int = tail.indexOf(needle)
-    if rel < 0 { return -1 }
-    return rel + start
+// Pedido sin Accept-Encoding.
+pub fn cache_lookup(host: String, path: String) -> String {
+    return cache_lookup_v(host, path, "")
 }
 
-fn _cc_contains_directive(cc: String, needle: String) -> int {
-    if cc.indexOf(needle) >= 0 { return 1 }
+// Vacía la caché entera (apagado en caliente: lo guardado no puede reaparecer
+// si se vuelve a encender). No cuenta como evictions.
+pub fn cache_clear() {
+    if g_cache_init_done == 0 { return 0 }
+    mutex_lock(g_cache_mtx)
+    var t: int = g_cache_tail[0]
+    while t >= 0 {
+        _lru_unlink(t)
+        _slot_free(t)
+        t = g_cache_tail[0]
+    }
+    mutex_unlock(g_cache_mtx)
     return 0
 }
 
-// Extrae N de "max-age=N". -1 si ausente o invalido.
-fn _parse_max_age(cc: String) -> int {
-    let pos: int = cc.indexOf("max-age=")
-    if pos < 0 { return -1 }
-    var p: int = pos + 8
-    let n: int = cc.length()
-    var digits: String = ""
+// ─────────────────────────────────────────────
+// Cabeceras
+// ─────────────────────────────────────────────
+
+// El bloque de cabecera de una respuesta: todo lo anterior al primer CRLFCRLF.
+// "" si no hay separador. Las cabeceras se leen SIEMPRE de acá: hasta v0.4.14
+// `Cache-Control` se buscaba con indexOf sobre la respuesta entera y, si la
+// cabecera no venía, un cuerpo que contuviera ese texto decidía el TTL.
+fn _resp_head(resp: String) -> String {
+    let pos: int = resp.indexOf("\r\n\r\n")
+    if pos < 0 { return "" }
+    return resp.substring(0, pos)
+}
+
+// Cabeceras de un bloque como pares [nombre en minúsculas, valor, ...]. La
+// primera línea (status line) se salta.
+fn _head_pairs(head: String) -> Array {
+    var out: Array = []
+    let lines: Array = head.split("\r\n")
+    var i: int = 1
+    while i < lines.length() {
+        let line: String = lines[i]
+        let c: int = line.indexOf(":")
+        if c > 0 {
+            let k: String = line.substring(0, c)
+            let v: String = line.substring(c + 1, line.byte_length())
+            out.push(k.trim().toLower())
+            out.push(v.trim())
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Valor de la cabecera `name_low` en pares [nombre, valor, ...], comparando el
+// nombre sin mayúsculas. Si aparece varias veces, los valores unidos con ", "
+// (RFC 9110 §5.3). "" si no está.
+fn _pairs_get(pairs: Array, name_low: String) -> String {
+    var out: String = ""
+    var found: int = 0
+    var i: int = 0
+    while i + 1 < pairs.length() {
+        let k: String = pairs[i]
+        if k.toLower() == name_low {
+            let v: String = pairs[i + 1]
+            if found == 1 {
+                out = out + ", " + v
+            } else {
+                out = v
+            }
+            found = 1
+        }
+        i = i + 2
+    }
+    return out
+}
+
+fn _pairs_has(pairs: Array, name_low: String) -> int {
+    var i: int = 0
+    while i + 1 < pairs.length() {
+        let k: String = pairs[i]
+        if k.toLower() == name_low { return 1 }
+        i = i + 2
+    }
+    return 0
+}
+
+// 1 si el pedido NO puede pasar por la caché, ni para leer ni para guardar:
+// trae `Cookie` o `Authorization` (aunque vengan vacías). `headers` son las
+// cabeceras del pedido en pares [nombre, valor, ...], como las recibe el router.
+pub fn cache_request_bypass(headers: Array) -> int {
+    if _pairs_has(headers, "cookie") == 1 { return 1 }
+    if _pairs_has(headers, "authorization") == 1 { return 1 }
+    return 0
+}
+
+// 1 si el parámetro de un elemento de Accept-Encoding dice q=0 («no lo acepto»).
+fn _q_is_zero(params: String) -> int {
+    let ps: Array = params.split(";")
+    var i: int = 0
+    while i < ps.length() {
+        let raw: String = ps[i]
+        let p: String = raw.trim()
+        if p.startsWith("q=") {
+            let rv: String = p.substring(2, p.byte_length())
+            let v: String = rv.trim()
+            if v == "0" or v == "0." or v == "0.0" or v == "0.00" or v == "0.000" { return 1 }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// El Accept-Encoding de un pedido reducido a una forma canónica: los códigos
+// CONOCIDOS que el cliente acepta (los de q=0 no), en orden fijo y separados
+// por coma: un subconjunto de "br,deflate,gzip,zstd,*". Lo desconocido se
+// descarta, así un cliente no puede fabricar variantes sin límite (son 32 como
+// mucho), y por eso cache_try_store_v solo guarda respuestas codificadas con
+// uno de esos cuatro.
+pub fn cache_accept_encoding_key(ae: String) -> String {
+    var br: int = 0
+    var deflate: int = 0
+    var gzip: int = 0
+    var zstd: int = 0
+    var star: int = 0
+    let parts: Array = ae.toLower().split(",")
+    var i: int = 0
+    while i < parts.length() {
+        let raw: String = parts[i]
+        var name: String = raw.trim()
+        var accepted: int = 1
+        let sc: int = name.indexOf(";")
+        if sc >= 0 {
+            let params: String = name.substring(sc + 1, name.byte_length())
+            if _q_is_zero(params) == 1 { accepted = 0 }
+            let nraw: String = name.substring(0, sc)
+            name = nraw.trim()
+        }
+        if accepted == 1 {
+            if name == "br" { br = 1 }
+            if name == "deflate" { deflate = 1 }
+            if name == "gzip" { gzip = 1 }
+            if name == "zstd" { zstd = 1 }
+            if name == "*" { star = 1 }
+        }
+        i = i + 1
+    }
+    var out: String = ""
+    if br == 1 { out = out + ",br" }
+    if deflate == 1 { out = out + ",deflate" }
+    if gzip == 1 { out = out + ",gzip" }
+    if zstd == 1 { out = out + ",zstd" }
+    if star == 1 { out = out + ",*" }
+    if out.byte_length() > 0 {
+        out = out.substring(1, out.byte_length())
+    }
+    return out
+}
+
+// 1 si la clave normalizada `ae` acepta el código `coding`.
+fn _ae_accepts(ae: String, coding: String) -> int {
+    let wrapped: String = "," + ae + ","
+    if wrapped.indexOf("," + coding + ",") >= 0 { return 1 }
+    if wrapped.indexOf(",*,") >= 0 { return 1 }
+    return 0
+}
+
+// Directivas de un Cache-Control como pares [nombre en minúsculas, valor, ...]
+// (valor "" si la directiva no lleva `=`). Se compara por directiva entera:
+// hasta v0.4.14 era por subcadena.
+fn _cc_directives(cc: String) -> Array {
+    var out: Array = []
+    let parts: Array = cc.split(",")
+    var i: int = 0
+    while i < parts.length() {
+        let raw: String = parts[i]
+        let d: String = raw.trim()
+        if d.byte_length() > 0 {
+            let eq: int = d.indexOf("=")
+            if eq < 0 {
+                out.push(d.toLower())
+                out.push("")
+            } else {
+                let dn: String = d.substring(0, eq)
+                let dv: String = d.substring(eq + 1, d.byte_length())
+                out.push(dn.trim().toLower())
+                out.push(dv.trim())
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Segundos de una directiva `max-age` / `s-maxage`. -1 si el valor no es un
+// número (se admite entre comillas).
+fn _delta_seconds(v: String) -> int {
+    var digits: String = v
+    if digits.startsWith("\"") and digits.endsWith("\"") and digits.byte_length() >= 2 {
+        digits = digits.substring(1, digits.byte_length() - 1)
+    }
+    let n: int = digits.byte_length()
+    if n == 0 { return -1 }
+    var p: int = 0
     while p < n {
-        let c: String = cc.substring(p, p + 1)
+        let c: String = digits.substring(p, p + 1)
         if c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9" {
-            digits = digits + c
             p = p + 1
         } else {
-            break
+            return -1
         }
     }
-    if digits.length() == 0 { return -1 }
     // RFC 9111 §1.2.2: un delta-seconds más grande de lo que se puede
     // representar vale 2^31. El tope también evita que `now + ttl` desborde, y
     // string_to_int abortaría el proxy por un header del upstream (desde Nyx
@@ -205,61 +414,91 @@ fn _parse_max_age(cc: String) -> int {
     return secs
 }
 
-// Lee el valor del header Cache-Control directamente del String de la
-// respuesta HTTP. Prueba casing comun y lowercase. Devuelve "" si no esta.
-fn _extract_cache_control(resp: String) -> String {
-    var key: String = "Cache-Control:"
-    var pos: int = resp.indexOf(key)
-    if pos < 0 {
-        key = "cache-control:"
-        pos = resp.indexOf(key)
-    }
-    if pos < 0 { return "" }
-    let start: int = pos + key.length()
-    let line_end: int = _indexof_at(resp, "\r\n", start)
-    if line_end < 0 { return "" }
-    var val: String = resp.substring(start, line_end)
-    // trim leading space
-    if val.length() > 0 {
-        if val.substring(0, 1) == " " {
-            val = val.substring(1, val.byte_length())
-        }
-    }
-    return val
-}
-
 // Parsea status de "HTTP/1.1 NNN ". 0 si no se puede.
 fn _extract_status(resp: String) -> int {
-    if resp.length() < 12 { return 0 }
+    if resp.byte_length() < 12 { return 0 }
     let s: String = resp.substring(9, 12)
     // Lo manda el upstream: un status que no es número es 0, no un abort.
     return string_to_int_or(s, 0)
 }
 
-// Intenta cachear el response. Parsea status + Cache-Control internamente.
-// Retorna 1 si se guardo, 0 en caso contrario.
-pub fn cache_try_store(host: String, path: String, response: String) -> int {
+// Con g_cache_mtx tomado: borra la entrada de `key` si existe.
+fn _remove_locked(key: String) {
+    if g_cache_map.contains(key) {
+        let idx: int = g_cache_map.get(key)
+        _lru_unlink(idx)
+        _slot_free(idx)
+    }
+    return 0
+}
+
+// Intenta guardar la respuesta de un pedido cuyo Accept-Encoding normalizado
+// es `ae`. Las reglas están en la cabecera del módulo. Retorna 1 si se guardó.
+pub fn cache_try_store_v(host: String, path: String, ae: String, response: String) -> int {
     if g_cache_enabled == 0 { return 0 }
-    if response.length() < 16 { return 0 }
+    if response.byte_length() < 16 { return 0 }
 
     let status: int = _extract_status(response)
     if status != 200 { return 0 }
 
-    let cc: String = _extract_cache_control(response)
-    if _cc_contains_directive(cc, "no-store") == 1 { return 0 }
-    if _cc_contains_directive(cc, "no-cache") == 1 { return 0 }
-    if _cc_contains_directive(cc, "private") == 1 { return 0 }
+    let head: String = _resp_head(response)
+    if head.byte_length() == 0 { return 0 }
+    let hs: Array = _head_pairs(head)
 
+    // Una respuesta que deja una cookie es de UN usuario.
+    if _pairs_has(hs, "set-cookie") == 1 { return 0 }
+
+    let cc: Array = _cc_directives(_pairs_get(hs, "cache-control"))
+    if _pairs_has(cc, "no-store") == 1 { return 0 }
+    if _pairs_has(cc, "no-cache") == 1 { return 0 }
+    if _pairs_has(cc, "private") == 1 { return 0 }
+
+    // Caché compartida: s-maxage manda sobre max-age (RFC 9111 §5.2.2.10).
     var ttl_s: int = g_cache_default_ttl_s
-    let max_age: int = _parse_max_age(cc)
-    if max_age >= 0 { ttl_s = max_age }
+    if _pairs_has(cc, "s-maxage") == 1 {
+        ttl_s = _delta_seconds(_pairs_get(cc, "s-maxage"))
+    } else if _pairs_has(cc, "max-age") == 1 {
+        ttl_s = _delta_seconds(_pairs_get(cc, "max-age"))
+    }
     if ttl_s <= 0 { return 0 }
 
-    let key: String = host + ":" + path
+    // Vary: solo se entiende Accept-Encoding. Cualquier otro (o `*`) significa
+    // que la respuesta depende de algo que la clave no mira: no se guarda.
+    var by_variant: int = 0
+    let vary: String = _pairs_get(hs, "vary")
+    if vary.byte_length() > 0 {
+        let vs: Array = vary.toLower().split(",")
+        var vi: int = 0
+        while vi < vs.length() {
+            let vraw: String = vs[vi]
+            if vraw.trim() != "accept-encoding" { return 0 }
+            vi = vi + 1
+        }
+        by_variant = 1
+    }
+    // Una respuesta codificada va SIEMPRE por variante, traiga Vary o no, y
+    // solo si el código es uno de los que la clave distingue y el pedido lo
+    // aceptaba: si no, le llegaría comprimida a un cliente que no lo pidió.
+    let ce_raw: String = _pairs_get(hs, "content-encoding")
+    let ce: String = ce_raw.toLower()
+    if ce.byte_length() > 0 and ce != "identity" {
+        if ce != "br" and ce != "deflate" and ce != "gzip" and ce != "zstd" { return 0 }
+        if _ae_accepts(ae, ce) == 0 { return 0 }
+        by_variant = 1
+    }
+
+    var key: String = _key_base(host, path)
+    if by_variant == 1 {
+        key = _key_variant(host, path, ae)
+    }
     let now_ms: int = time_ms()
     let expires_ms: int = now_ms + ttl_s * 1000
 
     mutex_lock(g_cache_mtx)
+    if by_variant == 1 {
+        // cache_lookup_v mira la base primero: una base vieja taparía la variante.
+        _remove_locked(_key_base(host, path))
+    }
     if g_cache_map.contains(key) {
         let idx: int = g_cache_map.get(key)
         g_cache_responses[idx] = response
@@ -285,6 +524,122 @@ pub fn cache_try_store(host: String, path: String, response: String) -> int {
     g_cache_size[0] = g_cache_size[0] + 1
     mutex_unlock(g_cache_mtx)
     return 1
+}
+
+// Respuesta a un pedido sin Accept-Encoding.
+pub fn cache_try_store(host: String, path: String, response: String) -> int {
+    return cache_try_store_v(host, path, "", response)
+}
+
+// ─────────────────────────────────────────────
+// Pedidos condicionales sobre un acierto (RFC 9111 §4.3.2)
+// ─────────────────────────────────────────────
+
+// 1 si el `If-None-Match` del pedido coincide con el ETag guardado. Comparación
+// DÉBIL (RFC 9110 §8.8.3.2): `W/"x"` y `"x"` coinciden. Admite lista y `*`.
+fn _inm_matches(inm: String, etag: String) -> int {
+    let s: String = inm.trim()
+    if s == "*" { return 1 }
+    let q: String = "\""
+    let e1: int = etag.indexOf(q)
+    if e1 < 0 { return 0 }
+    let want: String = etag.substring(e1, etag.byte_length())
+    if want.byte_length() < 2 or want.endsWith(q) == false { return 0 }
+    var rest: String = s
+    while true {
+        let a: int = rest.indexOf(q)
+        if a < 0 { return 0 }
+        let after: String = rest.substring(a + 1, rest.byte_length())
+        let b: int = after.indexOf(q)
+        if b < 0 { return 0 }
+        let cand: String = q + after.substring(0, b) + q
+        if cand == want { return 1 }
+        rest = after.substring(b + 1, after.byte_length())
+    }
+    return 0
+}
+
+// Una fecha IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") como un entero
+// comparable AAAAMMDDhhmmss. -1 si no tiene esa forma.
+fn _http_date_key(d: String) -> int {
+    let s: String = d.trim()
+    if s.byte_length() != 29 { return -1 }
+    if s.endsWith(" GMT") == false { return -1 }
+    let mon: String = s.substring(8, 11)
+    var mo: int = 0
+    if mon == "Jan" { mo = 1 }
+    if mon == "Feb" { mo = 2 }
+    if mon == "Mar" { mo = 3 }
+    if mon == "Apr" { mo = 4 }
+    if mon == "May" { mo = 5 }
+    if mon == "Jun" { mo = 6 }
+    if mon == "Jul" { mo = 7 }
+    if mon == "Aug" { mo = 8 }
+    if mon == "Sep" { mo = 9 }
+    if mon == "Oct" { mo = 10 }
+    if mon == "Nov" { mo = 11 }
+    if mon == "Dec" { mo = 12 }
+    if mo == 0 { return -1 }
+    let day: int = string_to_int_or(s.substring(5, 7), -1)
+    let year: int = string_to_int_or(s.substring(12, 16), -1)
+    let hh: int = string_to_int_or(s.substring(17, 19), -1)
+    let mi: int = string_to_int_or(s.substring(20, 22), -1)
+    let ss: int = string_to_int_or(s.substring(23, 25), -1)
+    if day < 0 or year < 0 or hh < 0 or mi < 0 or ss < 0 { return -1 }
+    return ((((year * 100 + mo) * 100 + day) * 100 + hh) * 100 + mi) * 100 + ss
+}
+
+// Si el pedido es condicional y lo guardado sigue valiendo para el cliente,
+// devuelve la respuesta 304 (sin cuerpo, marcada X-Nyx-Cache: HIT). "" si hay
+// que mandar la respuesta entera. `cached` es lo que devolvió cache_lookup_v;
+// `req_headers`, las cabeceras del pedido en pares.
+//   - If-None-Match manda: si viene, If-Modified-Since se ignora (RFC 9110 §13.1.3).
+//   - If-Modified-Since: 304 si es idéntico al Last-Modified guardado o, siendo
+//     los dos fechas IMF-fixdate, si Last-Modified no es posterior.
+pub fn cache_not_modified(cached: String, req_headers: Array) -> String {
+    let head: String = _resp_head(cached)
+    if head.byte_length() == 0 { return "" }
+    let hs: Array = _head_pairs(head)
+
+    var matched: int = 0
+    if _pairs_has(req_headers, "if-none-match") == 1 {
+        matched = _inm_matches(_pairs_get(req_headers, "if-none-match"), _pairs_get(hs, "etag"))
+    } else if _pairs_has(req_headers, "if-modified-since") == 1 {
+        let ims: String = _pairs_get(req_headers, "if-modified-since")
+        let lm: String = _pairs_get(hs, "last-modified")
+        if lm.byte_length() > 0 {
+            if ims.trim() == lm {
+                matched = 1
+            } else {
+                let k_ims: int = _http_date_key(ims)
+                let k_lm: int = _http_date_key(lm)
+                if k_ims >= 0 and k_lm >= 0 and k_lm <= k_ims { matched = 1 }
+            }
+        }
+    }
+    if matched == 0 { return "" }
+
+    // Las cabeceras que un 304 tiene que repetir (RFC 9110 §15.4.5), con la
+    // capitalización del upstream. Sin Content-Length: un 304 no lleva cuerpo.
+    let crlf: String = "\r\n"
+    var out: String = "HTTP/1.1 304 Not Modified" + crlf
+    let lines: Array = head.split(crlf)
+    var i: int = 1
+    while i < lines.length() {
+        let line: String = lines[i]
+        let c: int = line.indexOf(":")
+        if c > 0 {
+            let kraw: String = line.substring(0, c)
+            let k: String = kraw.trim().toLower()
+            if k == "cache-control" or k == "content-location" or k == "date" or k == "etag" or k == "expires" or k == "last-modified" or k == "vary" {
+                out = out + line + crlf
+            }
+        }
+        i = i + 1
+    }
+    out = out + "X-Nyx-Cache: HIT" + crlf
+    out = out + "Connection: keep-alive" + crlf + crlf
+    return out
 }
 
 // Marca un response cacheado con X-Nyx-Cache: HIT antes del CRLFCRLF.
@@ -330,10 +685,14 @@ fn sf_init() {
 // Retorna 1 si el caller debe ir al backend (claim del slot).
 // Retorna 0 si otro thread ya esta fetcheando (el caller debe llamar a
 // singleflight_wait + relookup).
-pub fn singleflight_claim(host: String, path: String) -> int {
+//
+// La clave lleva SIEMPRE el Accept-Encoding normalizado del pedido: al reclamar
+// todavía no se sabe si la respuesta va a variar, y un cliente que espera a
+// otro tiene que poder servirse de lo que ese otro guarde.
+pub fn singleflight_claim_v(host: String, path: String, ae: String) -> int {
     if g_cache_enabled == 0 { return 1 }
     sf_init()
-    let key: String = host + ":" + path
+    let key: String = _key_variant(host, path, ae)
     mutex_lock(g_sf_mtx)
     if g_sf_pending.contains(key) {
         mutex_unlock(g_sf_mtx)
@@ -353,13 +712,13 @@ pub fn singleflight_claim(host: String, path: String) -> int {
 // SIEMPRE al volver de cada wait — hay spurious wakeups Y el broadcast de
 // singleflight_release despierta a TODOS los waiters de TODAS las keys
 // sobre esta cv compartida, no solo los de la key que se libero.
-pub fn singleflight_wait(host: String, path: String, max_ms: int) -> String {
+pub fn singleflight_wait_v(host: String, path: String, ae: String, max_ms: int) -> String {
     if g_cache_enabled == 0 { return "" }
     sf_init()
     mutex_lock(g_sf_mtx)
     g_sf_waits[0] = g_sf_waits[0] + 1
 
-    let key: String = host + ":" + path
+    let key: String = _key_variant(host, path, ae)
     let start_ms: int = time_ms()
     var remaining: int = max_ms
     while g_sf_pending.contains(key) && remaining > 0 {
@@ -375,17 +734,17 @@ pub fn singleflight_wait(host: String, path: String, max_ms: int) -> String {
     }
     mutex_unlock(g_sf_mtx)
     // Fetcher ya libero el slot — relookup cache.
-    return cache_lookup(host, path)
+    return cache_lookup_v(host, path, ae)
 }
 
 // Libera el slot de inflight y despierta a TODOS los waiters (broadcast:
 // hay waiters de keys DISTINTAS compartiendo la misma condvar — un signal
 // simple podria despertar a uno equivocado y dejar dormido al que
 // corresponde a esta key).
-pub fn singleflight_release(host: String, path: String) {
+pub fn singleflight_release_v(host: String, path: String, ae: String) {
     if g_cache_enabled == 0 { return 0 }
     sf_init()
-    let key: String = host + ":" + path
+    let key: String = _key_variant(host, path, ae)
     mutex_lock(g_sf_mtx)
     if g_sf_pending.contains(key) {
         g_sf_pending.remove(key)
@@ -393,6 +752,19 @@ pub fn singleflight_release(host: String, path: String) {
     condvar_broadcast(g_sf_cv)
     mutex_unlock(g_sf_mtx)
     return 0
+}
+
+// Los tres nombres de antes: un pedido sin Accept-Encoding.
+pub fn singleflight_claim(host: String, path: String) -> int {
+    return singleflight_claim_v(host, path, "")
+}
+
+pub fn singleflight_wait(host: String, path: String, max_ms: int) -> String {
+    return singleflight_wait_v(host, path, "", max_ms)
+}
+
+pub fn singleflight_release(host: String, path: String) {
+    return singleflight_release_v(host, path, "")
 }
 
 // Snapshot adicional para metrics: [waits, timeouts].

@@ -224,6 +224,396 @@ fn test_snapshot_counters() {
     print("PASS: snapshot counters (size=" + int_to_string(size) + " hits=" + int_to_string(hits) + " misses=" + int_to_string(misses) + ")")
 }
 
+// ─────────────────────────────────────────────
+// Conducta de la reescritura (bypass, Set-Cookie, Cache-Control, Vary, 304)
+// ─────────────────────────────────────────────
+
+// Helper: varias cabeceras extra para mk_response.
+fn hdrs(a: String, b: String) -> String {
+    return a + "\r\n" + b
+}
+
+fn test_request_bypass() {
+    let c1: Array = ["Host", "x.test", "Cookie", "sid=1"]
+    assert(cache_request_bypass(c1) == 1)
+    let c2: Array = ["cookie", "sid=1"]
+    assert(cache_request_bypass(c2) == 1)
+    let c3: Array = ["Accept", "*/*", "AUTHORIZATION", "Bearer x"]
+    assert(cache_request_bypass(c3) == 1)
+    let c4: Array = ["Authorization", "Basic abc"]
+    assert(cache_request_bypass(c4) == 1)
+    // Valor vacío: igual cuenta.
+    let c5: Array = ["Cookie", ""]
+    assert(cache_request_bypass(c5) == 1)
+    let c6: Array = ["authorization", ""]
+    assert(cache_request_bypass(c6) == 1)
+    // Sin ellas: pasa.
+    let n1: Array = ["Accept", "text/html", "User-Agent", "curl/8"]
+    assert(cache_request_bypass(n1) == 0)
+    let n2: Array = []
+    assert(cache_request_bypass(n2) == 0)
+    // Un VALOR "cookie" no es la cabecera Cookie.
+    let n3: Array = ["X-Note", "cookie", "Accept", "authorization"]
+    assert(cache_request_bypass(n3) == 0)
+    print("PASS: cache_request_bypass detecta Cookie/Authorization en cualquier capitalizacion")
+}
+
+fn test_set_cookie_not_stored() {
+    let r1: String = mk_response(200, "Set-Cookie: sid=abc; Path=/", "user-body")
+    assert(cache_try_store("sc.test", "/a", r1) == 0)
+    assert(cache_lookup("sc.test", "/a").byte_length() == 0)
+    let r2: String = mk_response(200, "set-cookie: sid=abc", "user-body")
+    assert(cache_try_store("sc.test", "/b", r2) == 0)
+    assert(cache_lookup("sc.test", "/b").byte_length() == 0)
+    // Control: sin Set-Cookie se guarda.
+    let ok: String = mk_response(200, "", "anon-body")
+    assert(cache_try_store("sc.test", "/c", ok) == 1)
+    assert(cache_lookup("sc.test", "/c").indexOf("anon-body") >= 0)
+    print("PASS: Set-Cookie en la respuesta no se guarda")
+}
+
+fn test_cc_only_from_header() {
+    // Sin cabecera Cache-Control; el CUERPO dice no-store: se guarda igual.
+    let r1: String = mk_response(200, "", "texto Cache-Control: no-store en el cuerpo")
+    assert(cache_try_store("cc.test", "/body-nostore", r1) == 1)
+    let h1: String = cache_lookup("cc.test", "/body-nostore")
+    assert(h1.indexOf("en el cuerpo") >= 0)
+    // Cuerpo con max-age=0: tampoco impide guardar (ni fija el TTL).
+    let r2: String = mk_response(200, "", "Cache-Control: max-age=0")
+    assert(cache_try_store("cc.test", "/body-maxage0", r2) == 1)
+    assert(cache_lookup("cc.test", "/body-maxage0").indexOf("max-age=0") >= 0)
+    // Cuerpo con private / no-cache tampoco.
+    let r3: String = mk_response(200, "", "Cache-Control: private, no-cache")
+    assert(cache_try_store("cc.test", "/body-private", r3) == 1)
+    print("PASS: Cache-Control se lee solo de la cabecera, no del cuerpo")
+}
+
+fn test_cc_case_insensitive() {
+    let r1: String = mk_response(200, "CACHE-CONTROL: No-Store", "x")
+    assert(cache_try_store("cci.test", "/a", r1) == 0)
+    let r2: String = mk_response(200, "cache-control: NO-CACHE", "x")
+    assert(cache_try_store("cci.test", "/b", r2) == 0)
+    let r3: String = mk_response(200, "Cache-Control: PRIVATE, max-age=60", "x")
+    assert(cache_try_store("cci.test", "/c", r3) == 0)
+    // MAX-AGE en mayúsculas igual fija el TTL (60 > 0 -> se guarda).
+    let r4: String = mk_response(200, "CACHE-CONTROL: MAX-AGE=60", "mayus-ok")
+    assert(cache_try_store("cci.test", "/d", r4) == 1)
+    assert(cache_lookup("cci.test", "/d").indexOf("mayus-ok") >= 0)
+    let r5: String = mk_response(200, "Cache-Control: MAX-AGE=0", "x")
+    assert(cache_try_store("cci.test", "/e", r5) == 0)
+    print("PASS: Cache-Control sin distinguir mayusculas")
+}
+
+fn test_cc_whole_directive() {
+    // "private" solo como subcadena de una extensión: SÍ se guarda.
+    let r1: String = mk_response(200, "Cache-Control: max-age=60, x-private-ext=1", "ext-private")
+    assert(cache_try_store("ccd.test", "/a", r1) == 1)
+    assert(cache_lookup("ccd.test", "/a").indexOf("ext-private") >= 0)
+    let r2: String = mk_response(200, "Cache-Control: max-age=60, my-no-cache-hint", "hint-cache")
+    assert(cache_try_store("ccd.test", "/b", r2) == 1)
+    assert(cache_lookup("ccd.test", "/b").indexOf("hint-cache") >= 0)
+    let r3: String = mk_response(200, "Cache-Control: max-age=60, x-no-store-thing", "hint-store")
+    assert(cache_try_store("ccd.test", "/c", r3) == 1)
+    assert(cache_lookup("ccd.test", "/c").indexOf("hint-store") >= 0)
+    // Control: la directiva entera, con espacios alrededor, sí bloquea.
+    let r4: String = mk_response(200, "Cache-Control: max-age=60 ,  private ", "x")
+    assert(cache_try_store("ccd.test", "/d", r4) == 0)
+    // Un nombre de directiva que SOLO se parece a max-age no fija el TTL:
+    // "xmax-age=0" no es max-age, así que rige el TTL por defecto y se guarda.
+    let r5: String = mk_response(200, "Cache-Control: xmax-age=0", "no-es-maxage")
+    assert(cache_try_store("ccd.test", "/e", r5) == 1)
+    print("PASS: Cache-Control compara por directiva entera, no por subcadena")
+}
+
+fn test_smaxage_precedence() {
+    let r1: String = mk_response(200, "Cache-Control: max-age=0, s-maxage=60", "smax-gana")
+    assert(cache_try_store("smax.test", "/a", r1) == 1)
+    assert(cache_lookup("smax.test", "/a").indexOf("smax-gana") >= 0)
+    let r2: String = mk_response(200, "Cache-Control: max-age=60, s-maxage=0", "x")
+    assert(cache_try_store("smax.test", "/b", r2) == 0)
+    assert(cache_lookup("smax.test", "/b").byte_length() == 0)
+    // Orden invertido de las directivas: lo mismo.
+    let r3: String = mk_response(200, "Cache-Control: s-maxage=0, max-age=60", "x")
+    assert(cache_try_store("smax.test", "/c", r3) == 0)
+    print("PASS: s-maxage manda sobre max-age")
+}
+
+fn test_vary_ae_miss_and_hit() {
+    // El caso del reporte: un cliente sin Accept-Encoding recibía gzip.
+    let gz: String = mk_response(200, hdrs("Vary: Accept-Encoding", "Content-Encoding: gzip"), "CUERPO-GZIP")
+    assert(cache_try_store_v("vary.test", "/a", "gzip", gz) == 1)
+    let miss: String = cache_lookup_v("vary.test", "/a", "")
+    assert(miss.byte_length() == 0)
+    let hit: String = cache_lookup_v("vary.test", "/a", "gzip")
+    assert(hit.byte_length() > 0)
+    assert(hit.indexOf("CUERPO-GZIP") >= 0)
+    assert(hit.indexOf("Content-Encoding: gzip") >= 0)
+    // Otro ae (br) tampoco recibe lo gzip.
+    assert(cache_lookup_v("vary.test", "/a", "br").byte_length() == 0)
+    print("PASS: Vary Accept-Encoding: ae distinto es miss, ae igual es hit con su cuerpo")
+}
+
+fn test_vary_two_variants_coexist() {
+    let ident: String = mk_response(200, "Vary: Accept-Encoding", "CUERPO-IDENTIDAD")
+    let gz: String = mk_response(200, hdrs("Vary: Accept-Encoding", "Content-Encoding: gzip"), "CUERPO-GZ")
+    assert(cache_try_store_v("two.test", "/a", "", ident) == 1)
+    assert(cache_try_store_v("two.test", "/a", "gzip", gz) == 1)
+    let h0: String = cache_lookup_v("two.test", "/a", "")
+    let h1: String = cache_lookup_v("two.test", "/a", "gzip")
+    assert(h0.indexOf("CUERPO-IDENTIDAD") >= 0)
+    assert(h0.indexOf("CUERPO-GZ") < 0)
+    assert(h1.indexOf("CUERPO-GZ") >= 0)
+    assert(h1.indexOf("CUERPO-IDENTIDAD") < 0)
+    print("PASS: variantes identidad y gzip del mismo host/path conviven")
+}
+
+fn test_vary_other_not_stored() {
+    let r1: String = mk_response(200, "Vary: Cookie", "x")
+    assert(cache_try_store("vo.test", "/a", r1) == 0)
+    let r2: String = mk_response(200, "Vary: Accept-Encoding, Cookie", "x")
+    assert(cache_try_store_v("vo.test", "/b", "gzip", r2) == 0)
+    let r3: String = mk_response(200, "Vary: *", "x")
+    assert(cache_try_store("vo.test", "/c", r3) == 0)
+    let r4: String = mk_response(200, "Vary: Accept-Language", "x")
+    assert(cache_try_store("vo.test", "/d", r4) == 0)
+    assert(cache_lookup("vo.test", "/a").byte_length() == 0)
+    assert(cache_lookup_v("vo.test", "/b", "gzip").byte_length() == 0)
+    // Minúsculas y espacios: sí.
+    let ok: String = mk_response(200, "vary: accept-encoding", "vary-min")
+    assert(cache_try_store("vo.test", "/e", ok) == 1)
+    assert(cache_lookup("vo.test", "/e").indexOf("vary-min") >= 0)
+    print("PASS: Vary distinto de Accept-Encoding no se guarda (vary minusculas si)")
+}
+
+fn test_content_encoding_without_vary() {
+    let gz: String = mk_response(200, "Content-Encoding: gzip", "SIN-VARY-GZ")
+    assert(cache_try_store_v("cev.test", "/a", "gzip", gz) == 1)
+    assert(cache_lookup_v("cev.test", "/a", "").byte_length() == 0)
+    let hit: String = cache_lookup_v("cev.test", "/a", "gzip")
+    assert(hit.indexOf("SIN-VARY-GZ") >= 0)
+    // Content-Encoding en minúsculas / valor en mayúsculas.
+    let gz2: String = mk_response(200, "content-encoding: GZIP", "MAYUS-GZ")
+    assert(cache_try_store_v("cev.test", "/b", "gzip", gz2) == 1)
+    assert(cache_lookup_v("cev.test", "/b", "").byte_length() == 0)
+    assert(cache_lookup_v("cev.test", "/b", "gzip").indexOf("MAYUS-GZ") >= 0)
+    print("PASS: Content-Encoding sin Vary se guarda por variante")
+}
+
+fn test_content_encoding_not_accepted() {
+    let gz: String = mk_response(200, "Content-Encoding: gzip", "x")
+    assert(cache_try_store_v("cna.test", "/a", "", gz) == 0)
+    assert(cache_try_store_v("cna.test", "/b", "br", gz) == 0)
+    assert(cache_lookup_v("cna.test", "/a", "").byte_length() == 0)
+    assert(cache_lookup_v("cna.test", "/b", "br").byte_length() == 0)
+    // Código desconocido: no se guarda aunque el pedido acepte "*".
+    let cp: String = mk_response(200, "Content-Encoding: compress", "x")
+    assert(cache_try_store_v("cna.test", "/c", "gzip", cp) == 0)
+    assert(cache_try_store_v("cna.test", "/d", "*", cp) == 0)
+    // "*" sí acepta un código conocido.
+    let star: String = mk_response(200, "Content-Encoding: br", "estrella-br")
+    assert(cache_try_store_v("cna.test", "/e", "*", star) == 1)
+    assert(cache_lookup_v("cna.test", "/e", "*").indexOf("estrella-br") >= 0)
+    // identity explícito se trata como sin codificar (clave base).
+    let idn: String = mk_response(200, "Content-Encoding: identity", "es-identity")
+    assert(cache_try_store_v("cna.test", "/f", "gzip", idn) == 1)
+    assert(cache_lookup_v("cna.test", "/f", "").indexOf("es-identity") >= 0)
+    print("PASS: Content-Encoding no aceptado por el pedido o desconocido no se guarda")
+}
+
+fn test_base_key_serves_any_ae() {
+    let r: String = mk_response(200, "", "CUERPO-BASE")
+    assert(cache_try_store_v("base.test", "/a", "gzip", r) == 1)
+    assert(cache_lookup_v("base.test", "/a", "").indexOf("CUERPO-BASE") >= 0)
+    assert(cache_lookup_v("base.test", "/a", "br").indexOf("CUERPO-BASE") >= 0)
+    assert(cache_lookup_v("base.test", "/a", "gzip").indexOf("CUERPO-BASE") >= 0)
+    print("PASS: respuesta sin Vary ni Content-Encoding se sirve a cualquier ae")
+}
+
+fn test_variant_removes_base() {
+    let base: String = mk_response(200, "", "BASE-VIEJA")
+    assert(cache_try_store_v("rb.test", "/a", "", base) == 1)
+    assert(cache_lookup_v("rb.test", "/a", "").indexOf("BASE-VIEJA") >= 0)
+    let gz: String = mk_response(200, hdrs("Vary: Accept-Encoding", "Content-Encoding: gzip"), "VARIANTE-GZ")
+    assert(cache_try_store_v("rb.test", "/a", "gzip", gz) == 1)
+    // La base no puede taparla ni responderle a ae "".
+    assert(cache_lookup_v("rb.test", "/a", "").byte_length() == 0)
+    let h: String = cache_lookup_v("rb.test", "/a", "gzip")
+    assert(h.indexOf("VARIANTE-GZ") >= 0)
+    assert(h.indexOf("BASE-VIEJA") < 0)
+    print("PASS: guardar una variante borra la entrada base previa")
+}
+
+fn test_accept_encoding_key() {
+    assert(cache_accept_encoding_key("gzip, deflate, br, zstd") == "br,deflate,gzip,zstd")
+    assert(cache_accept_encoding_key("GZIP") == "gzip")
+    assert(cache_accept_encoding_key("") == "")
+    assert(cache_accept_encoding_key("gzip;q=0, br") == "br")
+    assert(cache_accept_encoding_key("gzip;q=0.5") == "gzip")
+    assert(cache_accept_encoding_key("x-foo, gzip") == "gzip")
+    assert(cache_accept_encoding_key("*") == "*")
+    assert(cache_accept_encoding_key("br, gzip") == cache_accept_encoding_key("gzip, br"))
+    assert(cache_accept_encoding_key("br, gzip") == "br,gzip")
+    // Extras: q=0.0 excluye; espacios alrededor; repetidos; solo desconocidos.
+    assert(cache_accept_encoding_key("gzip;q=0.0, br") == "br")
+    assert(cache_accept_encoding_key("  gzip ;  q=0 , deflate") == "deflate")
+    assert(cache_accept_encoding_key("gzip, gzip") == "gzip")
+    assert(cache_accept_encoding_key("x-foo, compress") == "")
+    assert(cache_accept_encoding_key("gzip, *") == "gzip,*")
+    print("PASS: cache_accept_encoding_key normaliza")
+}
+
+fn mk_cached_304() -> String {
+    let h: String = hdrs("ETag: \"abc\"", "Cache-Control: max-age=60")
+    return mk_response(200, h, "BODYXYZ")
+}
+
+fn test_not_modified_inm() {
+    let cached: String = mk_cached_304()
+    let rq: Array = ["If-None-Match", "\"abc\""]
+    let r: String = cache_not_modified(cached, rq)
+    assert(r.startsWith("HTTP/1.1 304"))
+    assert(r.indexOf("BODYXYZ") < 0)
+    assert(r.indexOf("Content-Length") < 0)
+    assert(r.indexOf("ETag: \"abc\"") >= 0)
+    assert(r.indexOf("Cache-Control: max-age=60") >= 0)
+    assert(r.indexOf("X-Nyx-Cache: HIT") >= 0)
+    assert(r.endsWith("\r\n\r\n"))
+    // No arrastra cabeceras que un 304 no repite.
+    assert(r.indexOf("Content-Type") < 0)
+    print("PASS: If-None-Match igual al ETag guardado -> 304 sin cuerpo")
+}
+
+fn test_not_modified_weak_and_list() {
+    let strong: String = mk_cached_304()
+    let weak_cached: String = mk_response(200, "ETag: W/\"abc\"", "BODYXYZ")
+    // Guardado débil, pedido fuerte.
+    let rq1: Array = ["If-None-Match", "\"abc\""]
+    assert(cache_not_modified(weak_cached, rq1).startsWith("HTTP/1.1 304"))
+    // Guardado fuerte, pedido débil.
+    let rq2: Array = ["If-None-Match", "W/\"abc\""]
+    assert(cache_not_modified(strong, rq2).startsWith("HTTP/1.1 304"))
+    // Los dos débiles.
+    assert(cache_not_modified(weak_cached, rq2).startsWith("HTTP/1.1 304"))
+    // Lista.
+    let rq3: Array = ["If-None-Match", "\"x\", W/\"abc\", \"y\""]
+    assert(cache_not_modified(strong, rq3).startsWith("HTTP/1.1 304"))
+    // Comodín.
+    let rq4: Array = ["If-None-Match", "*"]
+    assert(cache_not_modified(strong, rq4).startsWith("HTTP/1.1 304"))
+    // Distinto.
+    let rq5: Array = ["If-None-Match", "\"zzz\""]
+    assert(cache_not_modified(strong, rq5) == "")
+    // Prefijo / subcadena del guardado.
+    let rq6: Array = ["If-None-Match", "\"ab\""]
+    assert(cache_not_modified(strong, rq6) == "")
+    let rq7: Array = ["If-None-Match", "\"abcd\""]
+    assert(cache_not_modified(strong, rq7) == "")
+    let rq8: Array = ["If-None-Match", "\"bc\", \"b\""]
+    assert(cache_not_modified(strong, rq8) == "")
+    // Sin ETag guardado: un ETag pedido no coincide.
+    let noetag: String = mk_response(200, "", "BODYXYZ")
+    assert(cache_not_modified(noetag, rq1) == "")
+    print("PASS: If-None-Match debil, lista, comodin y no-coincidencias")
+}
+
+fn test_not_modified_lowercase_header() {
+    let cached: String = mk_cached_304()
+    let rq: Array = ["if-none-match", "\"abc\""]
+    assert(cache_not_modified(cached, rq).startsWith("HTTP/1.1 304"))
+    let rq2: Array = ["IF-NONE-MATCH", "\"abc\""]
+    assert(cache_not_modified(cached, rq2).startsWith("HTTP/1.1 304"))
+    print("PASS: If-None-Match con el nombre en minusculas/mayusculas")
+}
+
+fn test_not_modified_ims() {
+    let lm: String = "Sun, 06 Nov 1994 08:49:37 GMT"
+    let cached: String = mk_response(200, "Last-Modified: " + lm, "BODYLM")
+    let eq: Array = ["If-Modified-Since", lm]
+    let r: String = cache_not_modified(cached, eq)
+    assert(r.startsWith("HTTP/1.1 304"))
+    assert(r.indexOf("BODYLM") < 0)
+    assert(r.indexOf("Last-Modified: " + lm) >= 0)
+    // Posterior: 304.
+    let later: Array = ["If-Modified-Since", "Mon, 07 Nov 1994 08:49:37 GMT"]
+    assert(cache_not_modified(cached, later).startsWith("HTTP/1.1 304"))
+    let later_year: Array = ["if-modified-since", "Sun, 06 Nov 1995 08:49:37 GMT"]
+    assert(cache_not_modified(cached, later_year).startsWith("HTTP/1.1 304"))
+    // Anterior: hay que mandar la respuesta entera.
+    let earlier: Array = ["If-Modified-Since", "Sat, 05 Nov 1994 08:49:37 GMT"]
+    assert(cache_not_modified(cached, earlier) == "")
+    let earlier_sec: Array = ["If-Modified-Since", "Sun, 06 Nov 1994 08:49:36 GMT"]
+    assert(cache_not_modified(cached, earlier_sec) == "")
+    // Sin Last-Modified guardado.
+    let nolm: String = mk_response(200, "", "BODYLM")
+    assert(cache_not_modified(nolm, eq) == "")
+    print("PASS: If-Modified-Since igual/posterior -> 304, anterior o sin Last-Modified -> vacio")
+}
+
+fn test_not_modified_inm_wins_over_ims() {
+    let lm: String = "Sun, 06 Nov 1994 08:49:37 GMT"
+    let h: String = hdrs("ETag: \"abc\"", "Last-Modified: " + lm)
+    let cached: String = mk_response(200, h, "BODYBOTH")
+    // INM no coincide, IMS sí: NO hay 304.
+    let rq: Array = ["If-None-Match", "\"otro\"", "If-Modified-Since", lm]
+    assert(cache_not_modified(cached, rq) == "")
+    // Orden inverso de cabeceras: igual.
+    let rq2: Array = ["If-Modified-Since", lm, "If-None-Match", "\"otro\""]
+    assert(cache_not_modified(cached, rq2) == "")
+    // INM coincide, IMS no: 304 (manda INM).
+    let rq3: Array = ["If-None-Match", "\"abc\"", "If-Modified-Since", "Sat, 05 Nov 1994 08:49:37 GMT"]
+    assert(cache_not_modified(cached, rq3).startsWith("HTTP/1.1 304"))
+    print("PASS: si viene If-None-Match, If-Modified-Since se ignora")
+}
+
+fn test_not_modified_unconditional() {
+    let cached: String = mk_cached_304()
+    let rq: Array = ["Accept", "*/*", "Host", "x.test"]
+    assert(cache_not_modified(cached, rq) == "")
+    let rq0: Array = []
+    assert(cache_not_modified(cached, rq0) == "")
+    // Respuesta sin separador de cabecera: nada que hacer.
+    let rqi: Array = ["If-None-Match", "*"]
+    assert(cache_not_modified("basura", rqi) == "")
+    print("PASS: pedido sin condicionales -> vacio")
+}
+
+fn test_singleflight_per_variant() {
+    assert(singleflight_claim_v("sfv.test", "/p", "gzip") == 1)
+    // Otra variante es otra clave: también gana.
+    assert(singleflight_claim_v("sfv.test", "/p", "") == 1)
+    // La misma variante pierde.
+    assert(singleflight_claim_v("sfv.test", "/p", "gzip") == 0)
+    assert(singleflight_claim_v("sfv.test", "/p", "") == 0)
+    singleflight_release_v("sfv.test", "/p", "gzip")
+    // Liberar una no libera la otra.
+    assert(singleflight_claim_v("sfv.test", "/p", "") == 0)
+    assert(singleflight_claim_v("sfv.test", "/p", "gzip") == 1)
+    singleflight_release_v("sfv.test", "/p", "gzip")
+    singleflight_release_v("sfv.test", "/p", "")
+    print("PASS: single-flight reclama por variante de Accept-Encoding")
+}
+
+// Último: vacía la caché y rompe la premisa (size > 0) de test_snapshot_counters.
+fn test_cache_clear() {
+    let r: String = mk_response(200, "", "A-BORRAR")
+    assert(cache_try_store("clr.test", "/a", r) == 1)
+    assert(cache_lookup("clr.test", "/a").indexOf("A-BORRAR") >= 0)
+    assert(cache_snapshot()[0] > 0)
+    let ev0: int = cache_snapshot()[3]
+    cache_clear()
+    assert(cache_lookup("clr.test", "/a").byte_length() == 0)
+    assert(cache_lookup("example.com", "/").byte_length() == 0)
+    assert(cache_snapshot()[0] == 0)
+    // No cuenta como evictions.
+    assert(cache_snapshot()[3] == ev0)
+    // Sigue usable tras el clear.
+    assert(cache_try_store("clr.test", "/b", r) == 1)
+    assert(cache_lookup("clr.test", "/b").indexOf("A-BORRAR") >= 0)
+    cache_clear()
+    assert(cache_snapshot()[0] == 0)
+    print("PASS: cache_clear vacia la cache")
+}
+
 fn main() {
     test_basic_hit_miss()
     test_respect_no_store()
@@ -238,6 +628,28 @@ fn main() {
     test_singleflight_condvar_wakeup()
     test_singleflight_counters()
     test_snapshot_counters()
+    test_request_bypass()
+    test_set_cookie_not_stored()
+    test_cc_only_from_header()
+    test_cc_case_insensitive()
+    test_cc_whole_directive()
+    test_smaxage_precedence()
+    test_vary_ae_miss_and_hit()
+    test_vary_two_variants_coexist()
+    test_vary_other_not_stored()
+    test_content_encoding_without_vary()
+    test_content_encoding_not_accepted()
+    test_base_key_serves_any_ae()
+    test_variant_removes_base()
+    test_accept_encoding_key()
+    test_not_modified_inm()
+    test_not_modified_weak_and_list()
+    test_not_modified_lowercase_header()
+    test_not_modified_ims()
+    test_not_modified_inm_wins_over_ims()
+    test_not_modified_unconditional()
+    test_singleflight_per_variant()
+    test_cache_clear()
     print("")
     print("ALL nyx-proxy cache tests passed")
     return 0

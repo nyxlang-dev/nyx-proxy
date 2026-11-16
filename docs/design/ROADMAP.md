@@ -10,7 +10,7 @@
 > Sin números de versión: la fuente de verdad es `nyx.toml`. Sin conteo de tests: es
 > `scripts/run_unit_tests.sh`. El estado operativo del proyecto vive fuera del repo.
 >
-> Última actualización: 2026-09-25.
+> Última actualización: 2026-11-16.
 
 ---
 
@@ -32,6 +32,8 @@ lado la mencionaba.
 | `briefs/_recibidos/2026-09-24-nyxerp-forwarded.md` — X-Forwarded-Host/Proto al upstream | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-24 (v0.4.8): report al pie del encargo; falta re-vendorizar el gateway (lo hace el lenguaje) |
 | `briefs/_recibidos/2026-11-13-gateway-http2.md` — HTTP/2 hacia el navegador, SSE como flujo | repo del lenguaje, arco `gateway-http2` | **respondido** el 2026-11-13 (v0.4.13): report al pie; activarlo en el gateway de producción espera la confirmación del dueño |
 | `briefs/_recibidos/2026-09-25-pool-idle.md` — el pool reutiliza conexiones ya cerradas (502 en POST) | repo del lenguaje, sesión lang-c1 | **respondido** el 2026-09-25 (v0.4.9): report al pie; vendor y deploy del gateway los coordina el lenguaje |
+| `briefs/_recibidos/2026-11-14-cache-autenticada.md` — la caché servía respuestas autenticadas a pedidos sin sesión | sesión del servidor | **respondido** el 2026-11-16 (v0.5.0): report al pie; re-vendorizar el gateway y volver a encender la caché los decide el dueño |
+| `briefs/_recibidos/2026-11-16-cache-condicionales-y-vary.md` — 304 en el acierto, `Vary`, `Cache-Control` leído del cuerpo | repo del lenguaje | **respondido** el 2026-11-16 (v0.5.0): report al pie |
 
 ## Pendientes (sin arco todavía)
 

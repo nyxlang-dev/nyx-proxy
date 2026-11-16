@@ -38,10 +38,14 @@ tls_cert = "$WORK/c.pem"
 tls_key = "$WORK/k.pem"
 http2 = true
 
+[cache]
+enabled = 1
+
 [upstream.0]
 name = "app"
 host = "127.0.0.1"
 port = $BP
+cache = true
 TOML
 
 "$WORK/backend/bin" "$BP" >"$WORK/backend.log" 2>&1 & PIDS="$PIDS $!"; disown
@@ -83,6 +87,44 @@ CONNS=$(awk '{s+=$4} END{print s+0}' "$WORK/par.txt")
 check "las 9 peticiones usaron una sola conexión" "$CONNS" "1"
 VIVOS=0; for i in 1 2 3 4 5 6 7 8; do [ "$(grep -c '^event: tick' "$WORK/sse$i.txt" 2>/dev/null)" -ge 3 ] && VIVOS=$((VIVOS+1)); done
 check "los 8 canales SSE recibieron eventos" "$VIVOS" "8"
+
+# ── Caché y condicionales, con curl real por los dos frentes ────────────────
+# /estatico (50 KB, ETag, sin Cache-Control) y /privado (depende de la cookie, sin
+# Cache-Control). Cada chequeo mide el valor: código, bytes bajados, cabecera.
+SHA_EST=$(python3 -c "import hashlib;print(hashlib.sha256(('estatico-0123456789abcdef'*2000).encode()).hexdigest()[:16])")
+# fetch <flag de versión> <ruta> [args de curl...]: deja HC (código), SZ (bytes
+# del cuerpo), HDR (cabeceras en minúsculas) y BODY (archivo del cuerpo).
+fetch() {
+    local v="$1" ruta="$2"; shift 2
+    local w; w=$(curl -sk --max-time 5 "$v" -D "$WORK/h.txt" -o "$WORK/b.txt" -w '%{http_code} %{size_download}' "$@" "$U$ruta")
+    HC="${w% *}"; SZ="${w#* }"; HDR="$(tr -d '\r' < "$WORK/h.txt" | tr 'A-Z' 'a-z')"; BODY="$WORK/b.txt"
+}
+hit() { if echo "$HDR" | grep -q '^x-nyx-cache: hit'; then echo HIT; else echo no-HIT; fi; }
+for V in --http2 --http1.1; do
+    [ "$V" = "--http2" ] && P=h2 || P=h1
+    if [ "$V" = "--http2" ]; then
+        fetch $V /estatico
+        check "$P: primer GET de /estatico: 200 con el cuerpo íntegro" "$HC $SZ $(sha256sum <"$BODY" | cut -c1-16)" "200 50000 $SHA_EST"
+        check "$P: el primero sale del backend (sin HIT)" "$(hit)" "no-HIT"
+    fi
+    fetch $V /estatico -H 'If-None-Match: W/"e2e-1"'
+    check "$P: If-None-Match coincide: 304, 0 bytes, HIT" "$HC $SZ $(hit)" "304 0 HIT"
+    check "$P: el 304 repite el ETag" "$(echo "$HDR" | grep -c '^etag: w/"e2e-1"')" "1"
+    fetch $V /estatico -H 'If-None-Match: "otro"'
+    check "$P: If-None-Match distinto: 200 íntegro (sha256) y HIT" "$HC $SZ $(hit) $(sha256sum <"$BODY" | cut -c1-16)" "200 50000 HIT $SHA_EST"
+    fetch $V /estatico
+    check "$P: sin condicional: 200 íntegro (sha256) y HIT" "$HC $SZ $(hit) $(sha256sum <"$BODY" | cut -c1-16)" "200 50000 HIT $SHA_EST"
+done
+# ?v=: clave de caché propia por frente (la respuesta anónima de uno es un HIT legítimo para el otro).
+for V in --http2 --http1.1; do
+    [ "$V" = "--http2" ] && P=h2 || P=h1
+    fetch $V /privado?v=$P -H 'Cookie: s=alice'
+    check "$P: /privado con cookie: el cuerpo es el de alice" "$HC $(cat "$BODY") $(hit)" "200 privado de s=alice no-HIT"
+    fetch $V /privado?v=$P
+    check "$P: /privado sin cookie NO recibe lo de alice ni HIT" "$HC $(cat "$BODY") $(hit)" "200 anonimo no-HIT"
+    fetch $V /privado?v=$P -H 'Cookie: s=bob'
+    check "$P: /privado con otra cookie: la suya, no la guardada" "$HC $(cat "$BODY") $(hit)" "200 privado de s=bob no-HIT"
+done
 
 # Una petición lenta no frena a las demás del mismo navegador.
 ARGS=(-o "$WORK/lento.txt" "$U/lento" -o "$WORK/rapido.txt" "$U/hola")

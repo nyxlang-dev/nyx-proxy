@@ -3,6 +3,7 @@
 import "std/http"
 import "std/proxy"
 import "src/config"
+import "src/cache"
 import "src/router"
 import "src/health"
 import "src/logger"
@@ -63,6 +64,9 @@ fn main() -> int {
     }
     let cfg: String = args[1]
     load_config(cfg)
+    if g_cache_cfg_enabled == 1 {
+        cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)
+    }
     if tls_server_init(g_tls_cert, g_tls_key) < 0 {
         print("ERROR: TLS init")
         return 1

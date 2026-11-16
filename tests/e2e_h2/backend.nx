@@ -6,14 +6,30 @@ import "std/serve"
 import "std/http"
 
 fn avisos(req: Request) -> Response { return sse_open(req, "sala") }
-fn hola(_req: Request) -> Response { return response_new(200, "hola") }
+// La caché del gateway de prueba está encendida (ver run.sh): las rutas que los
+// chequeos viejos piden varias veces y esperan FRESCAS mandan no-store.
+fn sin_cache(r: Response) -> Response {
+    r.headers_flat.push("Cache-Control")
+    r.headers_flat.push("no-store")
+    return r
+}
+fn hola(_req: Request) -> Response { return sin_cache(response_new(200, "hola")) }
 fn lento(_req: Request) -> Response {
     sleep(1500)
-    return response_new(200, "lento")
+    return sin_cache(response_new(200, "lento"))
 }
 fn eco(req: Request) -> Response { return response_new(200, req.body) }
 fn grande(_req: Request) -> Response {
-    return response_new(200, "0123456789abcdef".repeat(64 * 293))
+    return sin_cache(response_new(200, "0123456789abcdef".repeat(64 * 293)))
+}
+
+// Estático de ~50 KB con ETag y SIN Cache-Control: el gateway lo guarda con el TTL
+// por defecto y contesta 304 a los condicionales sin tocar al backend.
+fn estatico(_req: Request) -> Response {
+    let r: Response = response_new(200, "estatico-0123456789abcdef".repeat(2000))
+    r.headers_flat.push("ETag")
+    r.headers_flat.push("W/\"e2e-1\"")
+    return r
 }
 fn cab(req: Request, nombre: String) -> String {
     var i: int = 0
@@ -31,7 +47,14 @@ fn cabeceras(req: Request) -> Response {
     var txt: String = "proto=" + cab(req, "x-forwarded-proto")
     txt = txt + " cookie=" + cab(req, "cookie")
     txt = txt + " xff=" + cab(req, "x-forwarded-for")
-    return response_new(200, txt)
+    return sin_cache(response_new(200, txt))
+}
+
+// Depende de la sesión, SIN Cache-Control: el caso del incidente del 14/11.
+fn privado(req: Request) -> Response {
+    let c: String = cab(req, "cookie")
+    if c.length() > 0 { return response_new(200, "privado de " + c) }
+    return response_new(200, "anonimo")
 }
 
 // Lo que std/serve entiende de la petición: el formulario, las cookies y el
@@ -51,7 +74,7 @@ fn entendido(req: Request) -> Response {
     return response_new(200, txt)
 }
 
-fn cuenta(_req: Request) -> Response { return response_new(200, int_to_string(sse_count())) }
+fn cuenta(_req: Request) -> Response { return sin_cache(response_new(200, int_to_string(sse_count()))) }
 
 fn latido() -> int {
     var n: int = 0
@@ -77,6 +100,8 @@ fn main() -> int {
     app_get(app, "/grande", grande)
     app_get(app, "/cabeceras", cabeceras)
     app_get(app, "/cuenta", cuenta)
+    app_get(app, "/estatico", estatico)
+    app_get(app, "/privado", privado)
     app_post(app, "/eco", eco)
     app_post(app, "/entendido", entendido)
     thread_spawn(latido)

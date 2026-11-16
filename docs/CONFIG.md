@@ -42,6 +42,7 @@ One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2,
 | `port` | int | Yes | Backend port |
 | `hostname` | string | No | Route by `Host` header value. `*.example.com` (v0.4.10+) matches exactly one non-empty label (`a.example.com`, not `example.com` nor `a.b.example.com`) — the same rule as a wildcard certificate. A `*` anywhere else is ignored with a warning at load. |
 | `path_prefix` | string | No | Route by request path prefix |
+| `cache` | bool | No | `true` (or `1`) sends this upstream's `GET` traffic through the response cache (v0.5.0+; default off). Needs `[cache] enabled = 1`, see [`[cache]`](#cache-v03). |
 
 **Routing priority** (per request):
 1. Upstream with matching `hostname` — exact hostnames first, then wildcards, regardless of their order in the file
@@ -52,19 +53,109 @@ One `[upstream.N]` block per upstream backend. `N` is an integer index (0, 1, 2,
 
 ## `[cache]` (v0.3+)
 
-Response cache (LRU + TTL). Only `GET 200` responses are cached, keyed by
-`host:path`; upstream `Cache-Control` is honored (`no-store` / `no-cache` /
-`private` bypass, `max-age=N` overrides the TTL). Cache misses are coalesced
-(single-flight), and hits carry an `X-Nyx-Cache: HIT` header. Note: the
-config only stores these values — the consumer must call
-`cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)` to activate
-the cache (both examples do).
+Response cache (LRU + TTL, shared between clients). **Since v0.5.0 it is opt-in
+per upstream**: `[cache] enabled = 1` alone stores nothing. Each upstream that
+wants caching must also say `cache = true` in its own `[upstream.N]` section;
+the proxy prints a warning at load if the cache is enabled but no upstream asks
+for it. Cache misses are coalesced (single-flight) and hits carry an
+`X-Nyx-Cache: HIT` header.
+
+Note: the config only stores these values — the consumer must call
+`cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)` at startup
+(both examples do).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | int | `0` | `1` enables the cache (via `cache_init`, see above) |
+| `enabled` | int | `0` | `1` enables the cache (together with `cache = true` on the upstream) |
 | `max_entries` | int | `10000` | LRU capacity |
-| `default_ttl_seconds` | int | `300` | TTL when the upstream sends no `max-age` |
+| `default_ttl_seconds` | int | `300` | TTL of a cacheable response that carries no `s-maxage` / `max-age` |
+
+```toml
+[cache]
+enabled = 1
+
+[upstream.0]
+name = "web"
+host = "127.0.0.1"
+port = 3000
+cache = true     # this upstream goes through the cache
+```
+
+**Migrating from v0.4.x:** add `cache = true` to every upstream you want
+cached. Until you do, a config with only `[cache] enabled = 1` caches nothing.
+
+### What goes through the cache
+
+A request is served from the cache, and its response is stored, only if **all**
+of these hold:
+
+| Condition | Detail |
+|-----------|--------|
+| Method is `GET` | Other methods always go to the upstream. |
+| The upstream has `cache = true` | And `[cache] enabled = 1` is in force. |
+| The request has no `Cookie` and no `Authorization` header | Such a request neither reads from the cache nor writes to it (even if the header is empty). The response to a signed-in user must never be served to someone else. |
+
+### What gets stored
+
+Everything is read from the response **headers** only (never from the body),
+case-insensitively, by whole directive.
+
+| Response | Stored? |
+|----------|---------|
+| Status other than `200` | No |
+| Has `Set-Cookie` | No |
+| `Cache-Control` contains `no-store`, `no-cache` or `private` | No |
+| `s-maxage=0`, `max-age=0`, or a value that is not a number | No |
+| No `Vary` | Yes, one entry per `host:path` |
+| `Vary: Accept-Encoding` | Yes, one entry per variant (see below) |
+| Any other `Vary` (or `Vary: *`) | No |
+| Has `Content-Encoding` (even without `Vary`) | Treated as `Vary: Accept-Encoding`; stored only if the coding is `br`, `deflate`, `gzip` or `zstd` and the request accepted it |
+
+**Variants.** The variant key is the request's `Accept-Encoding` normalized to
+the known codings it accepts (`br`, `deflate`, `gzip`, `zstd`, `*`), without the
+ones marked `q=0`, in a fixed order. A client that did not ask for `gzip`
+therefore never receives a `content-encoding: gzip` response.
+
+### How long it lives
+
+The TTL of a stored response is, in order:
+
+1. `s-maxage=N` from the upstream's `Cache-Control`;
+2. otherwise `max-age=N`;
+3. otherwise `default_ttl_seconds` (**300 seconds** if you do not set it).
+
+So a cacheable response with no `Cache-Control` at all lives 300 s. Entries are
+also evicted least-recently-used when `max_entries` is reached.
+
+### Conditional requests
+
+On a hit, the cache answers `304 Not Modified` with no body when:
+
+- the request's `If-None-Match` matches the stored `ETag` (weak comparison; a
+  list and `*` are accepted), or
+- the request has no `If-None-Match` and its `If-Modified-Since` is not earlier
+  than the stored `Last-Modified`.
+
+The 304 repeats `Cache-Control`, `Content-Location`, `Date`, `ETag`, `Expires`,
+`Last-Modified` and `Vary`, and carries `X-Nyx-Cache: HIT`. The access log and
+`/metrics` record it as a 304. It works the same over HTTP/1.1 and HTTP/2.
+Otherwise the full cached response is returned.
+
+### Turning it off
+
+- **Per upstream:** remove `cache = true` (or set it to `false`).
+- **Globally:** set `enabled = 0`.
+- **Hot reload:** `enabled` and the per-upstream `cache` flags are re-read on
+  hot reload (`reload_config_if_changed` / `watch_config_loop`; the consumer
+  must be running `watch_config_loop`). Turning the cache off empties it with
+  no restart; turning it on initializes it. `max_entries` and
+  `default_ttl_seconds` are only read the first time the cache is initialized.
+
+### Keeping a response out of the cache (from the backend)
+
+Send `Cache-Control: no-store` (or `private`, or `no-cache`) on the response.
+Responses that set a cookie, or vary on anything but `Accept-Encoding`, are
+never stored either.
 
 ---
 

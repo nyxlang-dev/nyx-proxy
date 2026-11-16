@@ -1,0 +1,440 @@
+// test_proxy_cache_router.nx — la caché de punta a punta A TRAVÉS DEL ROUTER, con
+// upstreams falsos reales (2026-11-16).
+//
+// Contexto: el 14/11/2026 la caché guardó la respuesta de un usuario con sesión
+// (Cookie) y se la sirvió a quien no la tenía. Las suites de cache.nx miran la
+// librería sola; acá se mide lo que le pasa a un pedido que entra por
+// proxy_dispatch: cuántos pedidos RECIBE el upstream y qué cuerpo vuelve. Un test
+// que mira «volvió 200» pasa en verde sobre el bug que debería cazar.
+//
+// El upstream falso cuenta sus pedidos y contesta según el pedido (cookie,
+// Authorization, Accept-Encoding), con un número de serie en el cuerpo para poder
+// distinguir «la respuesta de este pedido» de «la que estaba guardada».
+
+import "std/http"
+import "std/proxy"
+import "src/config"
+import "src/cache"
+import "src/router"
+import "src/health"
+import "src/logger"
+import "src/ratelimit"
+import "src/metrics"
+
+let PUERTO_A: int = 19500   // upstream con `cache = true`
+let PUERTO_B: int = 19501   // upstream SIN `cache = true`
+let HOST_A: String = "cache.test"
+let HOST_B: String = "nocache.test"
+let RUTA_TOML: String = "/tmp/nyx_proxy_test_cache_router.toml"
+let RUTA_LOG: String = "/tmp/nyx_proxy_test_cache_router.log"
+let HILOS_POR_UPSTREAM: int = 4
+
+var g_srv: Array = [0, 0]
+// Pedidos que recibió cada upstream.
+var g_cnt: Array = [0, 0]
+var g_mtx: Map = Map.new()
+
+fn pedidos(idx: int) -> int {
+    mutex_lock(g_mtx)
+    let n: int = g_cnt[idx]
+    mutex_unlock(g_mtx)
+    return n
+}
+
+// Valor de la cabecera `nombre_baja:` dentro de las líneas del pedido ("" si no está).
+fn cab_pedido(lineas: Array, nombre_baja: String) -> String {
+    let marca: String = nombre_baja + ":"
+    var i: int = 0
+    while i < lineas.length() {
+        let l: String = lineas[i]
+        if l.toLower().startsWith(marca) {
+            return l.substring(str_byte_length(marca), str_byte_length(l)).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Arma la respuesta según la ruta. `serie` es el número de pedido de este upstream.
+fn respuesta(ruta: String, lineas: Array, serie: int) -> String {
+    let cookie: String = cab_pedido(lineas, "cookie")
+    let auth: String = cab_pedido(lineas, "authorization")
+    let ae: String = cab_pedido(lineas, "accept-encoding")
+    var extra: String = ""
+    var cuerpo: String = "pub#" + int_to_string(serie)
+    if ruta.startsWith("/priv") {
+        // Dependiente de la sesión, SIN Cache-Control: es el caso del incidente.
+        if cookie.length() > 0 or auth.length() > 0 {
+            cuerpo = "privado de [" + cookie + auth + "] #" + int_to_string(serie)
+        } else {
+            cuerpo = "anonimo #" + int_to_string(serie)
+        }
+    } else if ruta.startsWith("/setcookie") {
+        extra = "Set-Cookie: sid=" + int_to_string(serie) + "; Path=/\r\n"
+    } else if ruta.startsWith("/etag") {
+        extra = "ETag: W/\"v1\"\r\nLast-Modified: Sun, 06 Nov 1994 08:49:37 GMT\r\n"
+        cuerpo = "E".repeat(20000)
+    } else if ruta.startsWith("/vary") {
+        extra = "Vary: Accept-Encoding\r\n"
+        if ae.indexOf("gzip") >= 0 {
+            extra = extra + "Content-Encoding: gzip\r\n"
+            cuerpo = "GZ"
+        } else {
+            cuerpo = "PLANO"
+        }
+    }
+    return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" + extra + "Content-Length: " + int_to_string(str_byte_length(cuerpo)) + "\r\n\r\n" + cuerpo
+}
+
+// Bucle de un hilo del upstream `idx`: acepta una conexión y la atiende (keep-alive)
+// hasta que se cierra. Hay varios hilos por upstream: si el router abre una
+// conexión nueva mientras el pool guarda otra ociosa, alguien la acepta.
+fn servir(idx: int) -> int {
+    while true {
+        let c: int = tcp_accept(g_srv[idx])
+        if c < 0 { return 0 }
+        var viva: int = 1
+        while viva == 1 {
+            let rl: String = tcp_read_line(c)
+            if rl.length() == 0 {
+                viva = 0
+            } else {
+                var lineas: Array = []
+                var fin: int = 0
+                while fin == 0 {
+                    let l: String = tcp_read_line(c)
+                    if l.length() == 0 {
+                        fin = 1
+                    } else {
+                        lineas.push(l)
+                    }
+                }
+                mutex_lock(g_mtx)
+                g_cnt[idx] = g_cnt[idx] + 1
+                let serie: int = g_cnt[idx]
+                mutex_unlock(g_mtx)
+                let partes: Array = rl.split(" ")
+                let ruta: String = partes[1]
+                tcp_write(c, respuesta(ruta, lineas, serie))
+            }
+        }
+        tcp_close(c)
+    }
+    return 0
+}
+
+fn hilo_a() -> int { return servir(0) }
+fn hilo_b() -> int { return servir(1) }
+
+// ── helpers del lado cliente ────────────────────────────────────────────────
+
+fn pedir(host: String, ruta: String, extra: Array) -> String {
+    var h: Array = ["Host", host]
+    var i: int = 0
+    while i < extra.length() {
+        h.push(extra[i])
+        i = i + 1
+    }
+    let req: Array = ["request", "GET", ruta, h, ""]
+    return proxy_dispatch(req)
+}
+
+fn sin_extra() -> Array {
+    let v: Array = []
+    return v
+}
+
+fn cuerpo_de(resp: String) -> String {
+    let sep: int = resp.indexOf("\r\n\r\n")
+    if sep < 0 { return "" }
+    return resp.substring(sep + 4, str_byte_length(resp))
+}
+
+fn es_hit(resp: String) -> bool {
+    return resp.indexOf("X-Nyx-Cache: HIT") >= 0
+}
+
+fn status_de(resp: String) -> String {
+    return resp.substring(0, 12)
+}
+
+// Valor de una serie de requests_total en el /metrics ("host","clase"), 0 si no existe.
+fn metrica(host: String, clase: String) -> int {
+    let txt: String = metrics_render()
+    let marca: String = "nyx_proxy_requests_total{host=\"" + host + "\",status=\"" + clase + "\"} "
+    let p: int = txt.indexOf(marca)
+    if p < 0 { return 0 }
+    let resto: String = txt.substring(p + str_byte_length(marca), str_byte_length(txt))
+    let nl: int = resto.indexOf("\n")
+    return string_to_int(resto.substring(0, nl).trim())
+}
+
+// Cuántas líneas del access log contienen `marca`.
+fn lineas_log(marca: String) -> int {
+    let txt: String = read_file(RUTA_LOG)
+    let ls: Array = txt.split("\n")
+    var n: int = 0
+    var i: int = 0
+    while i < ls.length() {
+        let l: String = ls[i]
+        if l.indexOf(marca) >= 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn toml(cache_activa: int) -> String {
+    var t: String = "[server]\nlisten = 18082\naccess_log = \"" + RUTA_LOG + "\"\n\n"
+    t = t + "[cache]\nenabled = " + int_to_string(cache_activa) + "\nmax_entries = 100\ndefault_ttl_seconds = 300\n\n"
+    t = t + "[upstream.0]\nname = \"con_cache\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_A) + "\nhostname = \"" + HOST_A + "\"\ncache = true\n\n"
+    t = t + "[upstream.1]\nname = \"sin_cache\"\nhost = \"127.0.0.1\"\nport = " + int_to_string(PUERTO_B) + "\nhostname = \"" + HOST_B + "\"\n"
+    return t
+}
+
+// ── casos ───────────────────────────────────────────────────────────────────
+
+// El incidente: un pedido con sesión no se sirve de la caché ni la alimenta.
+fn test_pedido_con_cookie_no_toca_la_cache() {
+    let n0: int = pedidos(0)
+    let a: String = pedir(HOST_A, "/priv", ["Cookie", "s=alice"])
+    assert(status_de(a) == "HTTP/1.1 200", "A: 200")
+    assert(cuerpo_de(a).indexOf("privado de [s=alice]") == 0, "A: el upstream vio la cookie de alice (" + cuerpo_de(a) + ")")
+    assert(pedidos(0) == n0 + 1, "A llegó al upstream")
+
+    // B, anónimo, al mismo host/path: tiene que llegar al upstream y NO traer lo de alice.
+    let b: String = pedir(HOST_A, "/priv", sin_extra())
+    assert(pedidos(0) == n0 + 2, "B (sin cookie) llegó al upstream: la respuesta de alice NO se guardó (pedidos=" + int_to_string(pedidos(0) - n0) + ")")
+    assert(es_hit(b) == false, "B no es HIT")
+    assert(cuerpo_de(b).indexOf("alice") < 0, "B no trae nada de alice (" + cuerpo_de(b) + ")")
+    assert(cuerpo_de(b).indexOf("anonimo") == 0, "B trae la respuesta anónima")
+
+    // C, anónimo otra vez: ahora sí sale de la caché, y es la de B.
+    let c: String = pedir(HOST_A, "/priv", sin_extra())
+    assert(pedidos(0) == n0 + 2, "C no llegó al upstream")
+    assert(es_hit(c), "C es HIT")
+    assert(cuerpo_de(c) == cuerpo_de(b), "C trae el cuerpo guardado de B")
+
+    // D, con cookie y con entrada guardada: igual va al upstream.
+    let d: String = pedir(HOST_A, "/priv", ["Cookie", "s=bob"])
+    assert(pedidos(0) == n0 + 3, "D (cookie) llegó al upstream aunque haya entrada")
+    assert(es_hit(d) == false, "D no es HIT")
+    assert(cuerpo_de(d).indexOf("privado de [s=bob]") == 0, "D trae lo de bob, no lo anónimo (" + cuerpo_de(d) + ")")
+
+    // Lo de D no pisó la entrada anónima.
+    let e: String = pedir(HOST_A, "/priv", sin_extra())
+    assert(es_hit(e) and cuerpo_de(e) == cuerpo_de(b), "la entrada anónima sigue siendo la de B")
+    assert(pedidos(0) == n0 + 3, "E no llegó al upstream")
+    print("PASS cache-router: un pedido con Cookie ni se sirve de la caché ni la alimenta")
+}
+
+fn test_authorization_y_nombres_en_minusculas() {
+    let n0: int = pedidos(0)
+    // Hay entrada anónima de /priv del caso anterior (o se crea acá).
+    pedir(HOST_A, "/priv2", sin_extra())
+    let base: String = cuerpo_de(pedir(HOST_A, "/priv2", sin_extra()))
+    assert(pedidos(0) == n0 + 1, "el anónimo de /priv2 se guardó (2º pedido fue HIT)")
+
+    let a: String = pedir(HOST_A, "/priv2", ["Authorization", "Bearer x"])
+    assert(pedidos(0) == n0 + 2, "Authorization llega al upstream aunque haya entrada")
+    assert(es_hit(a) == false, "Authorization: no es HIT")
+    assert(cuerpo_de(a).indexOf("privado de [Bearer x]") == 0, "Authorization: el cuerpo es el privado (" + cuerpo_de(a) + ")")
+
+    let b: String = pedir(HOST_A, "/priv2", ["authorization", "Bearer y"])
+    assert(pedidos(0) == n0 + 3, "`authorization` en minúsculas también llega")
+    assert(es_hit(b) == false and cuerpo_de(b).indexOf("Bearer y") > 0, "authorization minúscula: privado, sin HIT")
+
+    let c: String = pedir(HOST_A, "/priv2", ["cookie", "s=carol"])
+    assert(pedidos(0) == n0 + 4, "`cookie` en minúsculas también llega")
+    assert(es_hit(c) == false and cuerpo_de(c).indexOf("s=carol") > 0, "cookie minúscula: privado, sin HIT")
+
+    // Cookie vacía también cuenta como cookie.
+    let d: String = pedir(HOST_A, "/priv2", ["Cookie", ""])
+    assert(pedidos(0) == n0 + 5, "Cookie vacía tampoco se sirve de la caché")
+    assert(es_hit(d) == false, "Cookie vacía: sin HIT")
+
+    // La entrada anónima sigue intacta.
+    let e: String = pedir(HOST_A, "/priv2", sin_extra())
+    assert(es_hit(e) and cuerpo_de(e) == base, "la anónima sigue guardada e intacta")
+    print("PASS cache-router: Authorization y nombres en minúsculas tampoco pasan por la caché")
+}
+
+fn test_set_cookie_en_la_respuesta_no_se_guarda() {
+    let n0: int = pedidos(0)
+    let a: String = pedir(HOST_A, "/setcookie", sin_extra())
+    let b: String = pedir(HOST_A, "/setcookie", sin_extra())
+    assert(pedidos(0) == n0 + 2, "los dos pedidos anónimos llegaron al upstream (" + int_to_string(pedidos(0) - n0) + ")")
+    assert(es_hit(a) == false and es_hit(b) == false, "ninguno es HIT")
+    assert(cuerpo_de(a) != cuerpo_de(b), "cada uno trae su propia respuesta (sid distinta)")
+    assert(a.indexOf("Set-Cookie: sid=") > 0 and b.indexOf("Set-Cookie: sid=") > 0, "la cookie del upstream llega a cada cliente")
+    print("PASS cache-router: una respuesta con Set-Cookie no se guarda")
+}
+
+fn test_opt_in_por_upstream() {
+    let a0: int = pedidos(0)
+    let b0: int = pedidos(1)
+    // Sin cache = true: dos GET idénticos llegan los dos.
+    let b1: String = pedir(HOST_B, "/pub", sin_extra())
+    let b2: String = pedir(HOST_B, "/pub", sin_extra())
+    assert(pedidos(1) == b0 + 2, "upstream sin cache=true: los dos GET llegaron (" + int_to_string(pedidos(1) - b0) + ")")
+    assert(es_hit(b1) == false and es_hit(b2) == false, "upstream sin cache=true: ningún HIT")
+    assert(cuerpo_de(b1) != cuerpo_de(b2), "upstream sin cache=true: cada pedido trae su serie")
+    // Con cache = true: el segundo es HIT.
+    let a1: String = pedir(HOST_A, "/pub", sin_extra())
+    let a2: String = pedir(HOST_A, "/pub", sin_extra())
+    assert(pedidos(0) == a0 + 1, "upstream con cache=true: solo el primero llegó")
+    assert(es_hit(a1) == false and es_hit(a2), "upstream con cache=true: el segundo es HIT")
+    assert(cuerpo_de(a2) == cuerpo_de(a1), "el HIT trae el cuerpo del primero")
+    print("PASS cache-router: la caché es opt-in por upstream (cache = true)")
+}
+
+fn test_304_en_el_acierto() {
+    let n0: int = pedidos(0)
+    let g: String = pedir(HOST_A, "/etag", sin_extra())
+    assert(status_de(g) == "HTTP/1.1 200" and str_byte_length(cuerpo_de(g)) == 20000, "primer GET: 200 con el cuerpo entero")
+    assert(pedidos(0) == n0 + 1, "primer GET llegó al upstream")
+
+    let r: String = pedir(HOST_A, "/etag", ["If-None-Match", "W/\"v1\""])
+    assert(status_de(r) == "HTTP/1.1 304", "If-None-Match coincide: 304 (" + status_de(r) + ")")
+    assert(r.indexOf("EEEE") < 0 and str_byte_length(cuerpo_de(r)) == 0, "el 304 no lleva cuerpo")
+    assert(es_hit(r), "el 304 trae X-Nyx-Cache: HIT")
+    assert(r.indexOf("ETag: W/\"v1\"") > 0, "el 304 repite el ETag")
+    assert(r.indexOf("Content-Length") < 0, "el 304 no trae Content-Length")
+    assert(pedidos(0) == n0 + 1, "el upstream NO recibió un segundo pedido")
+
+    // Comparación débil: la forma fuerte coincide con el ETag débil guardado.
+    let f: String = pedir(HOST_A, "/etag", ["If-None-Match", "\"v1\""])
+    assert(status_de(f) == "HTTP/1.1 304", "comparación débil: \"v1\" coincide con W/\"v1\"")
+    let l: String = pedir(HOST_A, "/etag", ["If-None-Match", "\"x\", W/\"v1\""])
+    assert(status_de(l) == "HTTP/1.1 304", "lista de ETags con uno que coincide")
+    let st: String = pedir(HOST_A, "/etag", ["If-None-Match", "*"])
+    assert(status_de(st) == "HTTP/1.1 304", "If-None-Match: *")
+
+    // No coincide: 200 entero desde la caché.
+    let o: String = pedir(HOST_A, "/etag", ["If-None-Match", "\"otro\""])
+    assert(status_de(o) == "HTTP/1.1 200", "If-None-Match que no coincide: 200")
+    assert(str_byte_length(cuerpo_de(o)) == 20000, "200 con el cuerpo entero (" + int_to_string(str_byte_length(cuerpo_de(o))) + ")")
+    assert(es_hit(o), "ese 200 sale de la caché")
+    assert(pedidos(0) == n0 + 1, "tampoco llegó al upstream")
+
+    // If-Modified-Since contra Last-Modified.
+    let i1: String = pedir(HOST_A, "/etag", ["If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"])
+    assert(status_de(i1) == "HTTP/1.1 304" and es_hit(i1), "If-Modified-Since igual al Last-Modified: 304")
+    let i2: String = pedir(HOST_A, "/etag", ["If-Modified-Since", "Mon, 07 Nov 1994 08:49:37 GMT"])
+    assert(status_de(i2) == "HTTP/1.1 304", "If-Modified-Since posterior: 304")
+    let i3: String = pedir(HOST_A, "/etag", ["If-Modified-Since", "Sat, 05 Nov 1994 08:49:37 GMT"])
+    assert(status_de(i3) == "HTTP/1.1 200" and str_byte_length(cuerpo_de(i3)) == 20000, "If-Modified-Since anterior: 200 entero")
+    // If-None-Match manda sobre If-Modified-Since.
+    let i4: String = pedir(HOST_A, "/etag", ["If-None-Match", "\"otro\"", "If-Modified-Since", "Sun, 06 Nov 1994 08:49:37 GMT"])
+    assert(status_de(i4) == "HTTP/1.1 200", "If-None-Match que no coincide manda sobre If-Modified-Since")
+    assert(pedidos(0) == n0 + 1, "ningún condicional llegó al upstream")
+    print("PASS cache-router: 304 en el acierto (If-None-Match débil, lista, *, If-Modified-Since)")
+}
+
+fn test_vary_accept_encoding() {
+    let n0: int = pedidos(0)
+    let gz: String = pedir(HOST_A, "/vary", ["Accept-Encoding", "gzip"])
+    assert(cuerpo_de(gz) == "GZ" and gz.indexOf("Content-Encoding: gzip") > 0, "con gzip: cuerpo GZ y Content-Encoding")
+    assert(pedidos(0) == n0 + 1, "1º llegó")
+
+    let pl: String = pedir(HOST_A, "/vary", sin_extra())
+    assert(pedidos(0) == n0 + 2, "sin Accept-Encoding el pedido llega al upstream (no recibe la variante gzip)")
+    assert(cuerpo_de(pl) == "PLANO", "sin Accept-Encoding: PLANO (" + cuerpo_de(pl) + ")")
+    assert(pl.indexOf("Content-Encoding") < 0, "sin Accept-Encoding: sin Content-Encoding")
+    assert(es_hit(pl) == false, "no es HIT")
+
+    let gz2: String = pedir(HOST_A, "/vary", ["Accept-Encoding", "gzip"])
+    assert(es_hit(gz2) and cuerpo_de(gz2) == "GZ" and gz2.indexOf("Content-Encoding: gzip") > 0, "gzip otra vez: HIT de SU variante")
+    let pl2: String = pedir(HOST_A, "/vary", sin_extra())
+    assert(es_hit(pl2) and cuerpo_de(pl2) == "PLANO" and pl2.indexOf("Content-Encoding") < 0, "plano otra vez: HIT de SU variante")
+    // gzip;q=0 se normaliza a «sin codificaciones»: comparte la variante plana.
+    let q0: String = pedir(HOST_A, "/vary", ["Accept-Encoding", "gzip;q=0"])
+    assert(es_hit(q0) and cuerpo_de(q0) == "PLANO", "gzip;q=0 usa la variante plana")
+    assert(pedidos(0) == n0 + 2, "los repetidos no llegaron al upstream")
+    print("PASS cache-router: Vary: Accept-Encoding guarda una entrada por variante")
+}
+
+fn test_metrica_y_log_con_el_status_real() {
+    let m2: int = metrica(HOST_A, "2xx")
+    let m3: int = metrica(HOST_A, "3xx")
+    let a: String = pedir(HOST_A, "/etag-m1", sin_extra())
+    assert(status_de(a) == "HTTP/1.1 200", "miss: 200")
+    assert(metrica(HOST_A, "2xx") == m2 + 1 and metrica(HOST_A, "3xx") == m3, "el miss cuenta 2xx y no 3xx")
+    let r: String = pedir(HOST_A, "/etag-m1", ["If-None-Match", "W/\"v1\""])
+    assert(status_de(r) == "HTTP/1.1 304", "acierto condicional: 304")
+    assert(metrica(HOST_A, "3xx") == m3 + 1, "el 304 queda en la métrica como 3xx (+1)")
+    assert(metrica(HOST_A, "2xx") == m2 + 1, "el 304 NO se cuenta como 2xx")
+    let r2: String = pedir(HOST_A, "/etag-m1", sin_extra())
+    assert(status_de(r2) == "HTTP/1.1 200" and es_hit(r2), "acierto no condicional: 200 HIT")
+    assert(metrica(HOST_A, "2xx") == m2 + 2 and metrica(HOST_A, "3xx") == m3 + 1, "el HIT 200 cuenta 2xx")
+    // Access log: status exacto.
+    assert(lineas_log(" GET /etag-m1 304 ") == 1, "access log: una línea 304 (" + int_to_string(lineas_log(" GET /etag-m1 304 ")) + ")")
+    assert(lineas_log(" GET /etag-m1 200 ") == 2, "access log: dos líneas 200 (el miss y el HIT)")
+    print("PASS cache-router: métrica y access log registran el 304 real")
+}
+
+fn test_apagado_en_caliente() {
+    let n0: int = pedidos(0)
+    let a: String = pedir(HOST_A, "/hot", sin_extra())
+    let b: String = pedir(HOST_A, "/hot", sin_extra())
+    assert(pedidos(0) == n0 + 1 and es_hit(b) and cuerpo_de(b) == cuerpo_de(a), "con la caché encendida el 2º es HIT")
+
+    // Apagar: enabled = 0 y recarga (g_config_mtime = 0 fuerza la recarga: el mtime
+    // tiene resolución de segundos y el archivo se reescribe en el mismo segundo).
+    write_file(RUTA_TOML, toml(0))
+    g_config_mtime = 0
+    assert(reload_config_if_changed() == 1, "la recarga se hizo")
+    assert(g_cache_cfg_enabled == 0, "la recarga leyó enabled = 0")
+    let c: String = pedir(HOST_A, "/hot", sin_extra())
+    let d: String = pedir(HOST_A, "/hot", sin_extra())
+    assert(pedidos(0) == n0 + 3, "apagada: los dos GET llegan al upstream (" + int_to_string(pedidos(0) - n0) + ")")
+    assert(es_hit(c) == false and es_hit(d) == false, "apagada: ningún HIT")
+    assert(cuerpo_de(c) != cuerpo_de(a), "apagada: no se sirve lo que estaba guardado")
+
+    // Volver a encender: la caché se vació al apagar, así que lo viejo no reaparece.
+    write_file(RUTA_TOML, toml(1))
+    g_config_mtime = 0
+    assert(reload_config_if_changed() == 1, "la segunda recarga se hizo")
+    let e: String = pedir(HOST_A, "/hot", sin_extra())
+    assert(pedidos(0) == n0 + 4, "encendida de nuevo: el primer GET es miss")
+    assert(es_hit(e) == false and cuerpo_de(e) != cuerpo_de(a), "no reaparece la entrada vieja")
+    let f: String = pedir(HOST_A, "/hot", sin_extra())
+    assert(pedidos(0) == n0 + 4 and es_hit(f) and cuerpo_de(f) == cuerpo_de(e), "y el segundo es HIT (el cache = true sobrevivió a la recarga)")
+    print("PASS cache-router: apagado y encendido en caliente (enabled = 0 vacía la caché)")
+}
+
+fn main() -> int {
+    g_mtx = mutex_new()
+    remove_file(RUTA_LOG)
+    let sa: int = tcp_listen("127.0.0.1", PUERTO_A)
+    assert(sa >= 0, "bind del upstream A")
+    let sb: int = tcp_listen("127.0.0.1", PUERTO_B)
+    assert(sb >= 0, "bind del upstream B")
+    g_srv[0] = sa
+    g_srv[1] = sb
+    var i: int = 0
+    while i < HILOS_POR_UPSTREAM {
+        thread_spawn(hilo_a)
+        thread_spawn(hilo_b)
+        i = i + 1
+    }
+
+    write_file(RUTA_TOML, toml(1))
+    load_config(RUTA_TOML)
+    assert(g_cache_cfg_enabled == 1, "el toml enciende la caché")
+    assert(g_upstream_cache[0] == 1 and g_upstream_cache[1] == 0, "cache = true solo en el upstream 0")
+    cache_init(g_cache_cfg_max_entries, g_cache_cfg_default_ttl_s)
+    metrics_init()
+    pool_init()
+
+    test_pedido_con_cookie_no_toca_la_cache()
+    test_authorization_y_nombres_en_minusculas()
+    test_set_cookie_en_la_respuesta_no_se_guarda()
+    test_opt_in_por_upstream()
+    test_304_en_el_acierto()
+    test_vary_accept_encoding()
+    test_metrica_y_log_con_el_status_real()
+    test_apagado_en_caliente()
+    remove_file(RUTA_TOML)
+    remove_file(RUTA_LOG)
+    return 0
+}

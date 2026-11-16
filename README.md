@@ -85,6 +85,7 @@ name     = "app"
 host     = "127.0.0.1"
 port     = 3000
 hostname = "example.com"
+cache    = true     # este upstream pasa por la cache (v0.5.0+)
 
 # No hostname and no path_prefix -> default catch-all upstream
 [upstream.1]
@@ -92,8 +93,10 @@ name = "fallback"
 host = "127.0.0.1"
 port = 3000
 
-# Response cache LRU (v0.3+). Solo cachea GET 200 y honra Cache-Control
-# del upstream (no-store / no-cache / private bypassean, max-age=N override).
+# Response cache LRU (v0.3+). Opt-in por upstream desde v0.5.0: ademas de
+# `enabled = 1` hace falta `cache = true` en cada [upstream.N] que la quiera.
+# Solo cachea GET 200 sin Cookie/Authorization y honra Cache-Control del
+# upstream (no-store / no-cache / private bypassean, s-maxage/max-age mandan).
 [cache]
 enabled = 1
 max_entries = 10000
@@ -109,8 +112,16 @@ port = 9090
 
 ### Cache y `/metrics` (v0.3+)
 
-Con `[cache].enabled = 1`, responses `GET 200` se cachean bajo
-`HOST:PATH`. Los hits emiten `X-Nyx-Cache: HIT`:
+Desde v0.5.0 la cache es opt-in **por upstream**: hace falta
+`[cache].enabled = 1` y `cache = true` en cada `[upstream.N]` que la quiera
+(con solo lo primero no se guarda nada). Solo pasan por ella los `GET`, y
+nunca un pedido con `Cookie` o `Authorization`. Se guarda un `200` sin
+`Set-Cookie`, sin `no-store`/`no-cache`/`private`; dura `s-maxage`, o
+`max-age`, o `default_ttl_seconds` (300 s por omision). `Vary` sin cabecera =
+una entrada por `host:path`; `Vary: Accept-Encoding` = una por variante; otro
+`Vary` = no se guarda. Un pedido condicional (`If-None-Match` /
+`If-Modified-Since`) que acierta recibe `304`. Los hits emiten
+`X-Nyx-Cache: HIT`; detalle completo en [`docs/CONFIG.md`](docs/CONFIG.md):
 
 ```bash
 $ curl -sD - http://proxy/ -o /dev/null | grep X-Nyx-Cache
@@ -159,7 +170,7 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 | Section | Purpose |
 |---------|---------|
 | `[server]` | `listen`, `workers`, `rate_limit`, `health_check_interval`, `health_check_threshold`, `access_log`, `tls_cert`, `tls_key`, `http2` (v0.4.13+) |
-| `[upstream.N]` | `name`, `host`, `port`, optional `hostname` (vhost, exact or `*.domain`) or `path_prefix` |
+| `[upstream.N]` | `name`, `host`, `port`, optional `hostname` (vhost, exact or `*.domain`) or `path_prefix`, optional `cache = true` (v0.5.0+) |
 | `[cache]` | `enabled`, `max_entries`, `default_ttl_seconds` (v0.3+) |
 | `[metrics]` | `enabled`, `bind`, `port` (v0.3+) |
 
@@ -175,7 +186,7 @@ Full reference in [`docs/CONFIG.md`](docs/CONFIG.md). Key sections:
 - HTTP/1.1 to backends only — no HTTP/2 upstream. Toward clients, HTTP/2 is opt-in (`http2 = true`, v0.4.13+)
 - WebSocket passthrough terminates TLS at the proxy; the upstream leg is plain TCP
 - Health checks are TCP-only (no HTTP endpoint probing)
-- Response cache ignores `Vary` header (cache key is `host:path` only)
+- Response cache only understands `Vary: Accept-Encoding`; a response with any other `Vary` is not stored
 - No hot reload of TLS certificates (config routing does hot-reload via `watch_config_loop`; cert changes need a restart)
 
 ## License

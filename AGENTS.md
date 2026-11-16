@@ -118,8 +118,14 @@ su resultado en el buzón y despierta al bucle por el pipe; nunca toca el `ssl_h
 no hay candado sobre el `SSL*`, y agregar un segundo escritor lo rompe. Un fd de SSE diferido
 (`proxy_dispatch_o`) es de quien llamó: lo cierra y después `sse_slot_release()`, siempre en par.
 
-**No hay HTTP/2 al upstream** (solo HTTP/1.1), el cache **ignora `Vary`** (la clave es
-`host:path`) y los health checks son **solo TCP**.
+**No hay HTTP/2 al upstream** (solo HTTP/1.1), el cache solo entiende
+`Vary: Accept-Encoding` (una entrada por variante; cualquier otro `Vary` no se guarda) y los health checks son **solo TCP**.
+
+**Un pedido con `Cookie` o `Authorization` nunca toca la caché, y la caché es opt-in por upstream**
+(`cache = true`; `[cache] enabled = 1` solo no guarda nada). Hasta v0.4.14 la clave era `host:path`
+y valía para todos los pedidos: el 2026-11-14 la respuesta de un usuario con sesión se les sirvió a
+pedidos sin sesión durante todo el TTL. Si tocás `cache_request_bypass` o `cache_on_for`, el test
+que protege la regla es el de `tests/test_proxy_cache_router.nx`; no relajes ninguna de las dos.
 
 ## Tests
 
